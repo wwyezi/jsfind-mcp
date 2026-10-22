@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jsfind-mcp"
+version = "0.1.0"
+description = "MCP server for JavaScript information collection and sensitive-data scanning (regex + Tree-sitter AST)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "jsfind-mcp" }]
+keywords = ["mcp", "security", "javascript", "recon", "sensitive-data", "tree-sitter"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+dependencies = [
+    "httpx[http2]>=0.27",
+    "mcp>=1.2",
+    "pyyaml>=6.0",
+    "beautifulsoup4>=4.12",
+    "tree-sitter>=0.21",
+    "tree-sitter-javascript>=0.21",
+    "regex>=2023.0",
+]
+
+[project.optional-dependencies]
+# SOCKS proxies need httpx's own extra. Kept optional rather than required so
+# a plain HTTP-proxy user does not pull in a dependency they never use; a
+# SOCKS request without it fails with a message that says exactly this.
+proxy = ["httpx[socks]>=0.27"]
+
+[project.scripts]
+jsfind-mcp = "jsfind_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jsfind_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/jsfind_mcp", "tests", "README.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,158 @@
+# jsfind-mcp 默认配置。
+#
+# 加载优先级：--config 指定文件 > ./jsfind-mcp.yml > ~/.jsfind-mcp/config.yml >
+# 本文件（内嵌默认值）。后续层逐键覆盖前一层。
+mode: auto
+
+request:
+  timeout: 15s
+  target_timeout: 5m
+  retry: 1
+  # Outbound proxy for every request. A bare "host:port" is treated as http.
+  # Credentials may be included but are never echoed back to a caller.
+  proxy: ""
+  # Comma-separated hosts that bypass the proxy.
+  no_proxy: ""
+  # Honour HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY from the
+  # environment. Set false to make a scan provably direct.
+  trust_env: true
+  # 业务码语义：分类 -> 命中即视为该语义的响应体特征。
+  # 例：{"biz_auth_fail": ["\"code\":477"], "biz_success": ["\"code\":0"]}
+  # 命中后该接口的 signal 变为对应分类，200 + code:477 不再被当成成功。
+  business_codes: {}
+  # 留空时使用内置的桌面浏览器 UA。
+  user_agent: ""
+  headers: {}
+  cookies: {}
+  # 目标证书自签名时设为 true；默认关闭以便在测试环境直接采集。
+  verify_tls: false
+  max_redirects: 10
+
+browser:
+  # 留空时只使用 Playwright 自带的 Chromium。
+  path: ""
+  # 页面 load 之后再等待异步 JavaScript 的时间。
+  wait: 3s
+  # 判定“网络空闲”所需的最短静止时长。
+  idle: 800ms
+  # 空闲等待上限：轮询型 SPA 的网络永远不会静止 idle 时长，
+  # 到达上限后放弃等待、直接用已收集内容拍快照。0 表示不限制。
+  idle_max: 5s
+  timeout: 45s
+  headless: true
+  # 仅在受限容器/靶场中 Chromium 沙箱无法启动时开启。
+  no_sandbox: false
+  # 发现前端路由后逐个渲染，采集每个视图自己的请求。
+  # 默认关闭：它会成倍放大请求量。
+  crawl_routes: false
+  max_routes: 0
+  crawl_timeout: 60s
+  # 运行时自动填表并提交（算法适配自 projectdiscovery/katana，MIT）。
+  # 提交会触发目标自身的写操作，因此默认关闭。
+  auto_form: false
+  # 运行时点击按钮和带内联事件的元素，触发 SPA 隐藏的接口调用。默认关闭。
+  trigger_events: false
+  max_interactions: 20
+
+concurrency:
+  targets: 4
+  resources_per_target: 16
+
+limits:
+  max_depth: 5
+  # 0 表示不限制：所有可达的脚本与 chunk 都会被下载并解析。
+  max_resources: 0
+  # 超过该体积的脚本跳过 AST 解析（截断的语法树会产出看似可信的错误 URL）。
+  max_ast_bytes: 8388608
+
+scope:
+  allow_domains: []
+  # 非空时只抓取根目标与列表内域名：列表外的脚本不抓取、接口不探测。
+  restrict_domains: []
+  # 请求队列忽略 URL path 以这些后缀结尾的资源。
+  suffix_blacklist:
+    - .png
+    - .jpg
+    - .jpeg
+    - .gif
+    - .webp
+    - .svg
+    - .ico
+    - .bmp
+    - .tif
+    - .tiff
+    - .woff
+    - .woff2
+    - .ttf
+    - .otf
+    - .eot
+    - .mp3
+    - .wav
+    - .ogg
+    - .flac
+    - .mp4
+    - .webm
+    - .avi
+    - .mov
+    - .mkv
+    - .zip
+    - .rar
+    - .7z
+    - .tar
+    - .gz
+    - .pdf
+    - .wasm
+    - .exe
+    - .dll
+    - .dmg
+    - .iso
+    - .css
+  fetch_external_scripts: true
+  # 探测第三方主机上的接口会把只读收集变成对第三方的主动流量，默认关闭。
+  probe_external_endpoints: false
+  probe_routes: false
+  # 识别版权注释判定第三方库 bundle 并跳过 AST/参数解析：
+  # 库代码体量大但不含目标业务接口。默认开启。
+  skip_library_bundles: true
+  # 探测 JS source map 并把 sourcesContent 还原出的源码重新喂给提取器。
+  # 生产站点多半忘了删 .map，拿到它基本等于拿到未压缩的整套前端源码。
+  probe_source_maps: true
+  # 命中的 map 不探测：路径包含任一片段即跳过（库/厂商 bundle 的 map 又大又没用）。
+  source_map_blacklist:
+    - chunk-vendors
+    - chunk-libs
+    - vendors~
+    - /vendor
+    - node_modules
+    - /polyfills
+    - /runtime.
+    - /libs/
+    - axios
+    - lodash
+    - jquery
+    - moment
+    - echarts
+    - element-ui
+    - elementui
+    - antd
+    - highlight.js
+    - /umd/
+    - core-js
+    - regenerator-runtime
+    - zone.js
+    - bootstrap
+
+output:
+  directory: ./jsfind-mcp-report
+  json: true
+  html: true
+  # 只保存普通 JavaScript 和 chunk；接口响应正文不会保存。
+  download_js: true
+  js_directory: js
+  # 为每个接口复原 HTTP 请求包：源码有字面量值的参数保真，
+  # 其余生成 {{fuzz:...}} 占位符，可直接复制进 burp/yakit 重放。
+  request_template: true
+
+hosts:
+  # 额外视为主机"内部"的后缀；匹配的是完整的后缀链，例如 svc.corp 命中 corp。
+  internal_suffixes: []

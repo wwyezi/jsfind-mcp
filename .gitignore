@@ -1,0 +1,20 @@
+﻿__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# scan output - collected JS can contain live credentials, never commit it
+jsfind-js/
+jsfind-mcp-js/
+
+# Written on every startup and deliberately machine-specific: the whole point of
+# these two is to carry the absolute path of *this* installation so a client
+# config can be pasted as-is. They are regenerated on launch, never committed.
+mcp.json
+MCP-CONFIG.md
+
+# PyInstaller writes its analysis log into the cwd it was run from.
+warn-*.txt

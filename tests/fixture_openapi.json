@@ -1,0 +1,40 @@
+{
+  "openapi": "3.0.1",
+  "info": { "title": "local target API", "version": "2.4.0" },
+  "paths": {
+    "/admin/user/{id}": {
+      "get": {
+        "summary": "读取用户详情",
+        "operationId": "getUser",
+        "parameters": [
+          { "name": "id", "in": "path", "schema": { "type": "integer" } },
+          { "name": "verbose", "in": "query", "schema": { "type": "boolean" } }
+        ],
+        "security": [{ "bearerAuth": [] }]
+      },
+      "delete": { "summary": "删除用户", "deprecated": true }
+    },
+    "/admin/role": {
+      "post": {
+        "summary": "新增角色",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "roleName": { "type": "string" },
+                  "permissionIds": { "type": "array" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/public/health": { "get": { "summary": "健康检查" } }
+  },
+  "components": {
+    "securitySchemes": { "bearerAuth": { "type": "http", "scheme": "bearer" } }
+  }
+}

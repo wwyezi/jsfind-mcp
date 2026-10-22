@@ -1,0 +1,595 @@
+# jsfind-mcp 敏感信息与 URL 规则集（HaE 原生格式，github.com/gh0stkey/HaE）
+#
+# 本文件是内置规则的唯一来源，增删改规则只动这一个文件。用户级规则
+# ~/.jsfind-mcp/rules.yml 在首次运行时由本文件播种生成。
+#
+# 加载优先级：rules_file（显式指定）> ~/.jsfind-mcp/rules.yml（用户级）>
+# 内嵌默认值；同 ID 条目后者覆盖前者。
+#
+# 结构为 HaE 的 rules/group/rule：f_regex 为主正则，s_regex 为二级正则
+# （对提取结果复检/再提取，命中才保留），format 用 {N} 引用捕获组定义输出，
+# loaded=false 关闭单条规则，sensitive=true 表示区分大小写（缺省 false，即
+# 忽略大小写）。scope/color 为 HaE 原生字段：scope 在本项目无意义被忽略，
+# color 映射为严重级别；severity/category 为 jsfind-mcp 扩展字段，显式声明时
+# 优先于 color。
+#
+# 规则 ID 由 组名/规则名 自动生成（hae.<组名>.<规则名>），disabled 列表按此
+# ID 寻址。
+rules:
+- group: 密钥凭证
+  rule:
+  - name: 云账号配置值
+    loaded: true
+    f_regex: "(?i)account[_-]?(?:name|key)?\\s*[:=]\\s*[\"']?([\\w-]+)"
+    s_regex: ''
+    format: '{1}'
+    color: yellow
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: medium
+  - name: 私钥标识
+    loaded: true
+    f_regex: "(?i)private[_-]?key[_-]?(?:id)?\\s*[:=]\\s*[\"']?([\\w-]+)"
+    s_regex: ''
+    format: '{1}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: high
+  - name: JWT token
+    loaded: true
+    f_regex: "[\"'](ey[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9._-]{10,}\\.[A-Za-z0-9._-]{10,})[\"']"
+    s_regex: ''
+    format: '{1}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: high
+  - name: 凭据字段值
+    loaded: true
+    f_regex: "(?i)(?:password|username|access[_-]?key|access[_-]?token|secret|pwd)\\s*[:=]\\s*['\\\"]?([A-Za-z0-9_@./:+*#~%-]{3,200})"
+    s_regex: "^(?![+\\-!*&|<>=])(?!.*(?:===|==|!=|&&|\\|\\|))(?!^[A-Za-z_$][\\w$]*(?:\\.[\\w$]+)+$)"
+    format: '{1}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: high
+  - name: 华为OSS凭据
+    loaded: true
+    f_regex: "(?i)huawei\\.oss\\.(?:ak|sk|bucket\\.name|endpoint|local\\.path)\\s*[:=]\\s*[\"']?([\\w.-]+)"
+    s_regex: ''
+    format: '{1}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: high
+  - name: AWS Access Key
+    loaded: true
+    f_regex: "\\b(?:AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Za-z0-9]{16}\\b"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+  - name: 阿里云 Access Key
+    loaded: true
+    f_regex: "\\bLTAI[A-Za-z0-9]{12,20}\\b"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+  - name: GitHub Token
+    loaded: true
+    f_regex: "\\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{22,255}\\b"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+  - name: Google OAuth Token
+    loaded: true
+    f_regex: "\\bya29\\.[0-9A-Za-z_-]+\\b"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+  - name: PEM 私钥内容
+    loaded: true
+    f_regex: "(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+  - name: JDBC 连接串
+    loaded: true
+    f_regex: "(?i)\\bjdbc:[a-z0-9]+://[a-z0-9._:@/?&=;-]+"
+    s_regex: ''
+    format: '{0}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: high
+  - name: 通用敏感 Key-Value
+    loaded: true
+    f_regex: "(?i)(?:access|admin|api|debug|auth|authorization|gpg|ops|ray|deploy|s3|certificate|aws|app|application|docker|elastic|elasticsearch|secret)[_-]{0,5}(?:key|token|secret|secretkey|pass|password|sid|debug)\\s*[:=]\\s*[\"']?([^'\"\\s&,;]+)"
+    s_regex: ''
+    format: '{1}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: high
+  - name: SonarQube Token
+    loaded: true
+    f_regex: "(?i)sonar.{0,50}[\"'`]?([0-9a-f]{40})[\"'`]?"
+    s_regex: ''
+    format: '{1}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+  - name: OpenID 或 AppSecret
+    loaded: true
+    f_regex: "(?i)[\"'](?:openid|appsecret)[\"']\\s*:\\s*[\"']([^\"']+)[\"']"
+    s_regex: ''
+    format: '{1}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+  - name: Outlook Webhook
+    loaded: true
+    f_regex: "https://outlook\\.office\\.com/webhook/[A-Za-z0-9@-]+[^\\s\"']*IncomingWebhook/[A-Za-z0-9-]+/[A-Za-z0-9-]+"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+  - name: S3 云资源地址
+    loaded: true
+    f_regex: "(?i)(?:s3://[A-Za-z0-9._-]+|[A-Za-z0-9._-]+\\.s3[.-][A-Za-z0-9._-]+|s3\\.amazonaws\\.com/[A-Za-z0-9._/-]+|s3\\.console\\.aws\\.amazon\\.com/s3/buckets/[A-Za-z0-9._-]+)"
+    s_regex: ''
+    format: '{0}'
+    color: yellow
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: medium
+  - name: RememberMe 参数值
+    loaded: true
+    f_regex: "(?i)(?:rememberMe)\\s*=\\s*([^&\"\\s]+)"
+    s_regex: ''
+    format: '{1}'
+    color: yellow
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: medium
+  - name: 用户名字段值
+    loaded: true
+    f_regex: "(?i)(?:user|username|uname)\\s*[:=]\\s*['\\\"]?([A-Za-z0-9_@./:+*#~%-]{2,40})"
+    s_regex: "^(?![+\\-!*&|<>=])(?!.*(?:===|==|!=|&&|\\|\\|))(?!^[A-Za-z_$][\\w$]*(?:\\.[\\w$]+)+$)"
+    format: '{1}'
+    color: yellow
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: medium
+  - name: 硬编码Authorization头
+    loaded: true
+    f_regex: "((?:basic|bearer|token)\\s+[A-Za-z0-9=+/_:.-]{16,})"
+    s_regex: ''
+    format: '{0}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: high
+  - name: 存储连接串
+    loaded: true
+    f_regex: "((?:AccountName|AccountKey|SharedAccessSignature)\\s*[=:]\\s*[\"']?(?:[\\w+/=-]{10,}))"
+    s_regex: ''
+    format: '{1}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: high
+  - name: 腾讯云SecretId
+    loaded: true
+    f_regex: "(\\bAKID[A-Za-z0-9]{32,40}\\b)"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+  - name: 腾讯云AppId与AppKey
+    loaded: true
+    f_regex: "(\\bappid\\b[\"']?\\s*[:=]\\s*[\"']?(?:\\d{6,12})[\"']?[^\\n]{0,80}\\bappkey\\b[\"']?\\s*[:=]\\s*[\"']?(?:\\w{16,}))"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: high
+  - name: 钉钉机器人Webhook
+    loaded: true
+    f_regex: "(https://oapi\\.dingtalk\\.com/robot/send\\?access_token=[A-Za-z0-9]{20,})"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+  - name: 企业微信机器人Webhook
+    loaded: true
+    f_regex: "(https://qyapi\\.weixin\\.qq\\.com/cgi-bin/webhook/send\\?key=[A-Za-z0-9-]{20,})"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+  - name: 飞书机器人Webhook
+    loaded: true
+    f_regex: "(https://open\\.feishu\\.cn/open-apis/bot/[A-Za-z0-9]{8,}/[A-Za-z0-9]{8,})"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: critical
+
+- group: PII
+  rule:
+  - name: 中国大陆手机号
+    loaded: true
+    f_regex: "\\b1(?:3[0-9]|4[5-9]|5[0-35-9]|6[6]|7[0-8]|8[0-9]|9[0-9])[0-9]{8}\\b"
+    s_regex: ''
+    format: '{0}'
+    color: yellow
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: medium
+  - name: 身份证号
+    loaded: true
+    f_regex: "((?<![0-9Xx])[1-9]\\d{5}(?:18|19|20)\\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\\d|3[01])\\d{3}[0-9Xx](?![0-9Xx]))"
+    s_regex: ''
+    format: '{0}'
+    color: red
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: high
+  - name: 邮箱地址
+    loaded: true
+    f_regex: "(\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*\\.[A-Za-z]{2,6}\\b)"
+    # The asset guard has to look at the part *after* the @: anchored at ^
+    # with [A-Za-z0-9.-]+ it can never reach across the @, so logo@2x.png and
+    # a@b.js both slipped through as "email addresses". Script and font
+    # extensions are listed too -- asset filenames are not the only source.
+    s_regex: '(?i)^(?![^@]*@[A-Za-z0-9.-]*\.(?:png|jpe?g|gif|webp|svg|bmp|ico|css|avif|tiff?|js|mjs|cjs|jsx|ts|tsx|json|map|woff2?|ttf|eot|otf|mp4|webm|wav|mp3|zip|pdf)(?:$|[^A-Za-z0-9]))(?![^@]*@[0-9.]+x$).+'
+    format: '{0}'
+    color: green
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: medium
+  - name: MAC地址
+    loaded: true
+    f_regex: "((?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[:.-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f]))"
+    s_regex: ''
+    format: '{0}'
+    color: green
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: low
+
+- group: 网络信息
+  rule:
+  - name: 内网IP
+    loaded: true
+    f_regex: "((?<![0-9.])(?:(?:10|127\\.[01])\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d{1,3}\\.\\d{1,3}|192\\.168\\.\\d{1,3}\\.\\d{1,3}|169\\.254\\.\\d{1,3}\\.\\d{1,3})(?![0-9.]))"
+    s_regex: ''
+    format: '{0}'
+    color: green
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: medium
+  - name: URL内嵌账密
+    loaded: true
+    f_regex: "((?:[A-Za-z0-9._%-]{2,}@[A-Za-z0-9.-]+):(?:[^@\\s'\"]{2,})@)"
+    s_regex: ''
+    format: '{0}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: high
+  - name: 云存储内网Endpoint
+    loaded: true
+    f_regex: "(?i)(?:oss|cos|kms|dbcs)[.-][a-z0-9-]+\\.myqcloud\\.com|(?:oss|oss-cn)-[a-z0-9-]+\\.aliyuncs\\.com"
+    s_regex: ''
+    format: '{0}'
+    color: green
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: low
+
+- group: 指纹暴露
+  rule:
+  - name: 系统路径
+    loaded: true
+    f_regex: '(?:[A-Za-z]:(?:\\{1,2}[\w .-]+)+|/(?:bin|dev|home|media|opt|root|sbin|sys|usr|boot|data|etc|lib|mnt|proc|run|srv|tmp|var)(?![A-Za-z0-9._-])(?:/[\w .-]+)*)'
+    s_regex: ''
+    format: '{0}'
+    color: green
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: low
+  - name: Swagger 暴露标记
+    loaded: true
+    f_regex: "(?i)(?:swagger-ui\\.html|[\"']swagger[\"']\\s*:|swaggerUi|swaggerVersion|/v[0-9]+/api-docs)"
+    s_regex: ''
+    format: '{0}'
+    color: green
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: low
+  - name: 登录表单
+    loaded: true
+    f_regex: "(?is)<form[^>]*>.*?type=[\"'](?:text|email)[\"'][^>]*>.*?type=[\"']password[\"'][^>]*>.*?</form>"
+    s_regex: ''
+    format: '{0}'
+    color: green
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: low
+  - name: Shiro指纹
+    loaded: true
+    f_regex: "(rememberMe=deleteMe)"
+    s_regex: ''
+    format: '{0}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: medium
+  - name: Druid控制台
+    loaded: true
+    f_regex: "(?i)(?:Druid Stat Index|druid/index\\.html|/druid/login\\.html)"
+    s_regex: ''
+    format: '{0}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: medium
+  - name: Vite开发模式残留
+    loaded: true
+    f_regex: "(?:/@vite/client|/@react-refresh|vite/dist/client)"
+    s_regex: ''
+    format: '{0}'
+    color: green
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: low
+  - name: Source Map 可获取
+    loaded: true
+    f_regex: "(?m)^//#\\s*sourceMappingURL=\\S+\\.map\\s*$"
+    s_regex: ''
+    format: '{0}'
+    color: green
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: medium
+  - name: 未打包注释（TODO/内部路径）
+    loaded: true
+    f_regex: "(?i)//\\s*TODO[:：]\\s*\\S{4,120}"
+    s_regex: ''
+    format: '{0}'
+    color: green
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: low
+  - name: 调试开关
+    loaded: true
+    f_regex: "(?i)[\"'](?:debug|dev|test|staging|internal|admin)[\"']\\s*:\\s*(?:true|1)[\"']?"
+    s_regex: ''
+    format: '{0}'
+    color: orange
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: medium
+
+- group: URL
+  rule:
+  - name: XMLHttpRequest URL
+    loaded: true
+    f_regex: "(?i)\\.open\\s*\\(\\s*[\"'](?:GET|POST|PUT|DELETE|PATCH)[\"']\\s*,\\s*[\"']([^\"']+)[\"']"
+    s_regex: ''
+    format: '{1}'
+    color: blue
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: info
+    category: url
+  - name: 完整 HTTP URL
+    loaded: true
+    f_regex: "https?://[A-Za-z0-9$_.+!*(),%:@&/?#~=-]+"
+    s_regex: ''
+    format: '{0}'
+    color: blue
+    scope: response body
+    engine: nfa
+    sensitive: false
+    severity: info
+    category: url
+
+- group: OA协同办公
+  rule:
+  # OA 与协同办公系统的自报信息。它们不只是指纹：泛微 e-cology 的
+  # /weaver/ 上下文、致远的 /seeyon/ 前缀，都是公开的已知攻击面入口。
+  - name: 泛微 e-cology 路径
+    loaded: true
+    f_regex: '(?i)(/weaver/|e-cology|/ecology/|weaver\.security|\bweaver\b)'
+    format: '{0}'
+    severity: medium
+  - name: 致远 Seeyon 路径
+    loaded: true
+    f_regex: '(?i)(/seeyon/|/seeyon[A-Za-z0-9_]*|seeyon[A-Za-z]*\.do\b)'
+    format: '{0}'
+    severity: medium
+  - name: 蓝凌 OA 路径
+    loaded: true
+    f_regex: '(?i)(/bpm/|/bpmOA/|/eap/|lbm\.htm)'
+    format: '{0}'
+    severity: low
+  - name: 泛微 Weaver 自报信息
+    loaded: true
+    f_regex: '(?i)\b(ecology|weaver|e-cology)\b\s*(?:version)?\s*[:=]?\s*["'']?([vV]?\d+\.\d+(?:\.\d+)?)'
+    format: '{2}'
+    severity: medium
+  - name: 钉钉扫码登录入口
+    loaded: true
+    f_regex: '(?i)(oapi\.dingtalk\.com/|(?:qyapi\.weixin\.qq\.com|open\.weixin\.qq\.com)/cgi-bin/(?:gettoken|corp|user|userid)|wxwork|dingtalk)'
+    format: '{0}'
+    severity: low
+
+- group: 身份标识
+  rule:
+  - name: 员工工号
+    loaded: true
+    f_regex: '(?i)\b(emp(?:loyee)?(?:_?no|_?number|_?id)?|staff_?no|job_?no|work_?no|ygbh|gh|bh|工号)\b\s*[:=]\s*["'']?([A-Za-z0-9]{3,20})'
+    format: '{2}'
+    severity: medium
+  - name: 用户名字段
+    loaded: true
+    f_regex: '(?i)\b(user_?name|user_?account|login_?name|login_?id|account_?name|corp_?user|j_username|uname|uid|工号|用户名)\b\s*[:=]\s*["'']?([A-Za-z0-9_.@-]{2,40})'
+    format: '{2}'
+    severity: low
+  - name: 疑似真实姓名
+    loaded: true
+    f_regex: '(?i)\b(real_?name|realname|full_?name|truename|nick_?name|display_?name|姓名|真实姓名)\b\s*[:=]\s*["'']?([\u4e00-\u9fa5]{2,4}(?:\s[\u4e00-\u9fa5]{2,4})?)'
+    format: '{2}'
+    severity: low
+  - name: 邮箱域名线索
+    loaded: true
+    f_regex: '(?i)\b(mail_?domain|maildomain|email_?domain|corp_?domain|company_?domain)\b\s*[:=]\s*["'']?([A-Za-z0-9.-]+\.[A-Za-z]{2,12})'
+    format: '{2}'
+    severity: low
+  - name: 用户枚举接口
+    loaded: true
+    f_regex: '(?i)["''](/[A-Za-z0-9_./{}-]*(?:user|member|employee|staff|account|principal|person)[A-Za-z0-9_./{}-]*(?:list|all|search|page|query|exist|count|detail|info)[A-Za-z0-9_./{}-]*)["'']'
+    format: '{0}'
+    severity: medium
+
+- group: 可利用凭据
+  rule:
+  - name: 短信与推送令牌
+    loaded: true
+    f_regex: '(?i)\b(sms_?(token|code|secret)|push_?(token|secret|key)|access_?key_?id|ak_?sk|app_?push_?(key|secret)|notify_?(token|secret)|webhook_?(token|secret))\b\s*[:=]\s*["'']?([A-Za-z0-9_.:-]{8,80})'
+    format: '{3}'
+    severity: high
+  - name: Base64 编码的疑似凭据
+    loaded: true
+    f_regex: '(?:\b(?:secret|token|password|pwd|key|auth)\b\s*[:=]\s*["''])([A-Za-z0-9+/]{24,}={0,2})(?:["''])'
+    # 仅凭长度判 Base64 会把函数名当凭据：generateVideoTrackFromCanvasCapture 是 38 个纯字母。真实编码值带数字或 +/= 字母表。
+    s_regex: '(?=.*[0-9+/=_])(?!^[A-Za-z_][A-Za-z0-9_]*$)'
+    format: '{1}'
+    severity: high
+  - name: 硬编码 Bearer 令牌
+    loaded: true
+    f_regex: '(?i)\bBearer\s+([A-Za-z0-9_.~+/-]{12,200}=*)'
+    format: '{1}'
+    severity: high
+  - name: OAuth 客户端密钥
+    loaded: true
+    f_regex: '(?i)\b(oauth_?client_?secret|client_?secret|consumer_?secret|app_?secret|api_?secret)\b\s*[:=]\s*["'']([^"'']{8,80})'
+    format: '{2}'
+    severity: critical
+  - name: 加密密钥或盐值
+    loaded: true
+    f_regex: '(?i)\b(encrypt_?key|encryption_?key|aes_?key|des_?key|rsa_?private|init_?vector|password_?salt|pepper|sign_?key|hmac_?key)\b\s*[:=]\s*["'']([^"'']{8,80})'
+    # iv 与裸 salt 已从字段名中移除：iv 只有两个字母，在压缩代码里作为变量名随处可见，iv:"INVALID_..." 因此被评成 critical 加密密钥。值过滤再挡掉标识符形状。
+    s_regex: '(?=.*[0-9+/=_-])(?!^[A-Za-z_][A-Za-z0-9_]*$)(?!^[A-Z][A-Z0-9_]*$)'
+    format: '{2}'
+    severity: critical
+  - name: 银行账户信息
+    loaded: true
+    f_regex: '(?<!\d)(?:\b62|\b81)\d{14,19}(?!\d)'
+    format: '{0}'
+    severity: high
+  - name: 身份证补充（15位）
+    loaded: true
+    f_regex: '(?<![0-9Xx])[1-9]\d{5}\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}(?![0-9Xx])'
+    format: '{0}'
+    severity: high
+  - name: 国际手机号
+    loaded: true
+    f_regex: '(?<!\d)\+?86?1[3-9]\d{9}(?!\d)'
+    format: '{0}'
+    severity: low
+- group: 构建信息
+  rule:
+  - name: CI 构建工作目录
+    loaded: true
+    f_regex: "/(?:home|Users|var/lib)/[A-Za-z0-9._-]+/workspace/[^\\s\\\"'\\)}\\];,]{6,200}"
+    format: '{0}'
+    severity: high
+  - name: 三方 CI 构建路径
+    loaded: true
+    f_regex: "(?:D:\\\\a\\\\|/builds/[^\\s\\\"']{3,80}|\\bworkdir=/builds)"
+    format: '{0}'
+    severity: medium
+  - name: 绝对源码路径
+    loaded: true
+    f_regex: "(?:/home/|/Users/|/var/lib/jenkins)[^\\s\\\"'\\)}\\];,]{4,180}\\.(?:vue|jsx?|tsx?|java|go|py|ts)\\b"
+    format: '{0}'
+    severity: medium
+  - name: 内联 SourceMap
+    loaded: true
+    f_regex: "version\\s*:\\s*3\\s*,\\s*sources\\s*:\\s*\\["
+    format: '{0}'
+    severity: medium

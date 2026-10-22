@@ -1,0 +1,407 @@
+# jsfind-mcp 服务端 / 中间件版本号规则集。
+#
+# 与 rules.yml 的区别：rules.yml 扫描**响应正文**（JavaScript、HTML），
+# 本文件扫描 **HTTP 响应头**与错误页正文中的服务端自报信息。
+#
+# 核心约定：**只认带版本号的匹配**。每条规则的版本捕获组必须含数字，
+# 因此 `Server: nginx` 不会产出任何结果，只有 `Server: nginx/1.18.0` 才会。
+# BannerEngine 另外有一道兜底校验：捕获到的版本里没有数字就丢弃。
+# 这样即便某条规则写松了，也不会凭空生成一个"无版本指纹"来污染报告。
+#
+# 字段说明：
+#   id       规则唯一标识（stable）
+#   product  产品名，报告中展示
+#   pattern  正则；捕获组 1 必须是版本号
+#   headers  限定只在该响应头中查找；留空表示所有响应头 + 正文
+#   category web_server | app_server | language | gateway | framework | cdn | db
+#   severity info | low | medium | high
+#   enabled  false 关闭单条规则
+#
+# 加载优先级：banners_file（配置指定）> 本文件 > ~/.jsfind-mcp/banners.yml
+banners:
+
+  # ── Web 服务器 / 反向代理 ─────────────────────────────────────────
+  - id: nginx
+    product: Nginx
+    category: web_server
+    pattern: '(?i)\bnginx/(\d+(?:\.\d+)+)'
+    headers: [server, x-powered-by, via, x-served-by]
+    severity: info
+
+  - id: openresty
+    product: OpenResty
+    category: web_server
+    pattern: '(?i)\bopenresty/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: info
+
+  - id: tengine
+    product: Tengine
+    category: web_server
+    pattern: '(?i)\btengine/(\d+(?:\.\d+)+)'
+    headers: [server, via]
+    severity: info
+
+  - id: apache
+    product: Apache HTTP Server
+    category: web_server
+    pattern: '(?i)\bapache(?:[- _]?http)?[ /](\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: info
+
+  - id: apache-coyote
+    product: Apache Tomcat (Coyote)
+    category: app_server
+    pattern: '(?i)\bapache[-_]?coyote/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: medium
+
+  - id: tomcat
+    product: Apache Tomcat
+    category: app_server
+    pattern: '(?i)\bapache tomcat/(\d+(?:\.\d+)+)'
+    headers: [server, x-powered-by]
+    severity: medium
+
+  - id: microsoft-iis
+    product: Microsoft IIS
+    category: web_server
+    pattern: '(?i)\bmicrosoft[-_]?iis/(\d+(?:\.\d+)+)'
+    headers: [server, x-powered-by, x-aspnet-version]
+    severity: info
+
+  - id: iis-aspnet-version
+    product: ASP.NET
+    category: framework
+    pattern: '(?i)^\s*(\d+\.\d+(?:\.\d+)*)\s*$'
+    headers: [x-aspnet-version, x-aspnetmvc-version]
+    severity: info
+
+  - id: jetty
+    product: Eclipse Jetty
+    category: app_server
+    pattern: '(?i)\bjetty\(?(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: medium
+
+  - id: litespeed
+    product: LiteSpeed
+    category: web_server
+    pattern: '(?i)\blitespeed(?:[- ]?enterprise)?/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: info
+
+  - id: openlitespeed
+    product: OpenLiteSpeed
+    category: web_server
+    pattern: '(?i)\bopenlitespeed/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: info
+
+  - id: h2o
+    product: H2O
+    category: web_server
+    pattern: '(?i)\bh2o/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: info
+
+  - id: boa
+    product: Boa HTTP Server
+    category: web_server
+    pattern: '(?i)\bboa/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: medium
+
+  - id: monkey-httpd
+    product: Monkey HTTP Server
+    category: web_server
+    pattern: '(?i)\bmonkey/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: medium
+
+  - id: grizzly
+    product: Grizzly
+    category: app_server
+    pattern: '(?i)\bgrizzly/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: medium
+
+  # ── 应用服务器 / Java 中间件 ──────────────────────────────────────
+  - id: jboss
+    product: JBoss
+    category: app_server
+    pattern: '(?i)\bjboss[-_]?(?:eap|as|web)/(\d+(?:\.\d+)+)'
+    headers: [server, x-powered-by]
+    severity: high
+
+  - id: jboss-wildfly
+    product: WildFly
+    category: app_server
+    pattern: '(?i)\bwildfly/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: medium
+
+  - id: websphere
+    product: IBM WebSphere
+    category: app_server
+    pattern: '(?i)\bwebsphere(?:[- ]?application[- ]?server)?[ /](\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: high
+
+  - id: weblogic
+    product: Oracle WebLogic
+    category: app_server
+    pattern: '(?i)\bweblogic(?:[- ]?server)?[ /](\d+(?:\.\d+)+)'
+    headers: [server, x-oracle weblogic-version]
+    severity: high
+
+  - id: resin
+    product: Caucho Resin
+    category: app_server
+    pattern: '(?i)\bresin/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: medium
+
+  - id: glassfish
+    product: GlassFish
+    category: app_server
+    pattern: '(?i)\bglassfish[^/\d]{0,40}[ /](\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: medium
+
+  - id: undertow
+    product: Undertow
+    category: app_server
+    pattern: '(?i)\bundertow/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: medium
+
+  - id: weblogic-plugins
+    product: WebLogic 插件版本
+    category: app_server
+    pattern: '(?i)\bweblogic(?:[- ]?plugins?)?[- ](\d+(?:\.\.\d+)+)'
+    headers: [x-weblogic-plugin-version, weblogic-plugin-version]
+    severity: medium
+
+  - id: spring-boot
+    product: Spring Boot
+    category: framework
+    pattern: '(?i)\bspring[- ]?boot(?:[ /](\d+(?:\.\d+)+))?'
+    headers: [x-application-context, x-powered-by]
+    severity: info
+    require_version: true
+
+  - id: spring-cloud-gateway
+    product: Spring Cloud Gateway
+    category: gateway
+    pattern: '(?i)\bspring[- ]?cloud[- ]?gateway(?:[ /](\d+(?:\.\d+)+))?'
+    headers: [x-application-context, server]
+    severity: info
+    require_version: true
+
+  # ── 语言运行时 / 脚本引擎 ─────────────────────────────────────────
+  - id: php
+    product: PHP
+    category: language
+    pattern: '(?i)\bphp/(\d+(?:\.\d+)+)'
+    headers: [x-powered-by, server]
+    severity: info
+
+  - id: php-x-powered-version
+    product: PHP
+    category: language
+    pattern: '(?i)\bphp(?:/(\d+(?:\.\d+)+))?\s+([a-z0-9.]{1,12})\s*$'
+    headers: [x-powered-by]
+    severity: info
+    require_version: true
+
+  - id: python
+    product: Python
+    category: language
+    pattern: '(?i)\bpython/(\d+(?:\.\d+)+)'
+    headers: [server, x-powered-by]
+    severity: info
+
+  - id: werkzeug
+    product: Werkzeug
+    category: framework
+    pattern: '(?i)\bwerkzeug/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: info
+
+  - id: gunicorn
+    product: Gunicorn
+    category: app_server
+    pattern: '(?i)\bgunicorn/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: info
+
+  - id: uvicorn
+    product: Uvicorn
+    category: app_server
+    pattern: '(?i)\buvicorn/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: info
+
+  - id: puma
+    product: Puma
+    category: app_server
+    pattern: '(?i)\bpuma/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: info
+
+  - id: webrick
+    product: WEBrick
+    category: app_server
+    pattern: '(?i)\bwebrick/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: info
+
+  - id: passenger
+    product: Phusion Passenger
+    category: app_server
+    pattern: '(?i)\bpassenger/(\d+(?:\.\d+)+)'
+    headers: [server, x-powered-by]
+    severity: info
+
+  - id: ruby
+    product: Ruby
+    category: language
+    pattern: '(?i)\bruby/(\d+(?:\.\d+)+)'
+    headers: [server, x-powered-by]
+    severity: info
+
+  - id: node
+    product: Node.js
+    category: language
+    pattern: '(?i)\bnode(?:\.js)?/(\d+(?:\.\d+)+)'
+    headers: [server, x-powered-by]
+    severity: info
+
+  - id: express
+    product: Express
+    category: framework
+    pattern: '(?i)\bexpress[ /](\d+(?:\.\d+)+)'
+    headers: [x-powered-by, server]
+    severity: info
+
+  - id: dotnet-aspnet-version
+    product: ASP.NET Core
+    category: framework
+    pattern: '(?i)\basp\.net(?: core)?[ /](\d+(?:\.\d+)+)'
+    headers: [x-powered-by, x-aspnet-version]
+    severity: info
+
+  # ── 网关 / 代理 / 负载均衡 ────────────────────────────────────────
+  - id: kong
+    product: Kong
+    category: gateway
+    pattern: '(?i)\bkong/(\d+(?:\.\d+)+)'
+    headers: [server, via, x-kong-proxy-latency]
+    severity: info
+
+  - id: apisix
+    product: Apache APISIX
+    category: gateway
+    pattern: '(?i)\bapisix/(\d+(?:\.\d+)+)'
+    headers: [server]
+    severity: info
+
+  - id: haproxy
+    product: HAProxy
+    category: gateway
+    pattern: '(?i)\bhaproxy/(\d+(?:\.\d+)+)'
+    headers: [server, via]
+    severity: info
+
+  - id: envoy
+    product: Envoy
+    category: gateway
+    pattern: '(?i)\benvoy[ /](\d+(?:\.\d+)+)'
+    headers: [server, via, x-envoy-version]
+    severity: info
+
+  - id: traefik
+    product: Traefik
+    category: gateway
+    pattern: '(?i)\btraefik[ /](\d+(?:\.\d+)+)'
+    headers: [server, via]
+    severity: info
+
+  - id: dubbo
+    product: Apache Dubbo
+    category: gateway
+    pattern: '(?i)\bdubbo[ /](\d+(?:\.\d+)+)'
+    headers: [server, x-powered-by]
+    severity: info
+
+  # ── 数据库 / 存储中间件（自报头少见，命中价值高） ────────────────
+  - id: mysql
+    product: MySQL
+    category: db
+    pattern: '(?i)\bmysql(?:[ /](\d+(?:\.\d+)+))?'
+    headers: [server, x-mysql-version, x-powered-by]
+    severity: info
+    require_version: true
+
+  - id: redis
+    product: Redis
+    category: db
+    pattern: '(?i)\bredis/(\d+(?:\.\d+)+)'
+    headers: [server, x-redis-version]
+    severity: medium
+
+  - id: mongodb
+    product: MongoDB
+    category: db
+    pattern: '(?i)\bmongodb(?:[ /](\d+(?:\.\d+)+))?'
+    headers: [server, x-mongodb-version]
+    severity: medium
+    require_version: true
+
+  - id: elasticsearch
+    product: Elasticsearch
+    category: db
+    pattern: '(?i)\belasticsearch/(\d+(?:\.\d+)+)'
+    headers: [server, x-elastic-product]
+    severity: info
+
+  # ── CDN / WAF / 云厂商接入层 ────────────────────────────────────
+  - id: aliyun-waf
+    product: 阿里云 WAF
+    category: cdn
+    pattern: '(?i)\baliyunwaf[ /](\d+(?:\.\d+)+)'
+    headers: [server, x-served-by]
+    severity: info
+
+  - id: aliyun-oss
+    product: 阿里云 OSS
+    category: cdn
+    pattern: '(?i)\baliyunoss/(\d+(?:\.\d+)+)'
+    headers: [server, x-oss-server]
+    severity: info
+
+  - id: tencent-cos
+    product: 腾讯云 COS
+    category: cdn
+    pattern: '(?i)\b(?:tencent)?[-_]?cos/(\d+(?:\.\d+)+)'
+    headers: [x-cos-server, server]
+    severity: info
+
+  - id: qcloud-clb
+    product: 腾讯云 CLB
+    category: cdn
+    pattern: '(?i)\bqcloud[-_]?clb/(\d+(?:\.\d+)+)'
+    headers: [server, x-nws-log-uuid]
+    severity: info
+
+  - id: wangsu
+    product: 网宿 CDN
+    category: cdn
+    pattern: '(?i)\bwangsu[-_]?(?:cloud)?[-_]?cdn[ /](\d+(?:\.\d+)+)'
+    headers: [server, x-ws-server]
+    severity: info
+
+# 注意：本文件只收录**带版本号**的指纹。像 X-Iinfo 这类只有事件 ID、没有版本
+# 的响应头一律不写进来 —— 没有版本号的"指纹"对测试者没有可行动的信息，
+# 写进来只会稀释报告的信噪比。
