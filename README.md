@@ -60,7 +60,7 @@ Webpack / RequireJS / Vite chunk、source map 还原的原始源码、**资源�
 | **服务版本识别** | 53 条中间件版本规则，**只认带版本号的指纹** |
 | **攻击面排序** | 一次调用给出测试切入点，每条带理由，并说明本次**没看到什么** |
 | **离线分析** | 直接分析本地 JS/HTML/目录，不发起任何网络请求 |
-| **可打包为单文件** | 同一份 spec 产出 Windows `.exe` 与 Linux 二进制 |
+| **可打包为单文件** | spec 产出 Windows `.exe`  |
 
 ## 安装
 需要 Python 3.10+。Tree-sitter AST 依赖 `tree-sitter` 与
