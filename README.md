@@ -63,11 +63,6 @@ Webpack / RequireJS / Vite chunk、source map 还原的原始源码、**资源�
 | **可打包为单文件** | 同一份 spec 产出 Windows `.exe` 与 Linux 二进制 |
 
 ## 安装
-
-```bash
-pip install jsfind-mcp
-```
-
 需要 Python 3.10+。Tree-sitter AST 依赖 `tree-sitter` 与
 `tree-sitter-javascript`；若安装失败会自动退化为纯正则（接口方法与参数精度下降，
 其余功能不受影响），可用 `jsfind_diagnostics` 工具确认当前状态。
@@ -333,13 +328,7 @@ request:
 | **写错是一句话，不是 traceback** | `htp://x`、`http://`、`http://h:notaport` 都在开扫之前就返回明确错误，而不是在 httpx 构造客户端时炸掉 |
 | **实际生效的代理会回报** | `trust_env=true` 时环境变量可能才是真正生效的那条。**悄悄直连**和**按预期走代理**在结果里长得一样——这是最该被看见的差别 |
 
-SOCKS 需要额外依赖（保持可选，不用 SOCKS 的人不必装）：
 
-```bash
-pip install "jsfind-mcp[proxy]"
-```
-
-没装却配了 `socks5://` 时，`jsfind_diagnostics` 和扫描结果都会明确提示缺 `socksio`，而不是让请求莫名失败。
 
 > ⚠️ **走代理意味着目标看到的是代理的 IP。** 授权测试里这通常是想要的（不暴露自己的出口 IP、跨地域验证），但也意味着**目标的日志里记的是代理**。用 `no_proxy` 把内网资产排除在代理之外，否则内网接口会变成从外网打不通。
 
@@ -453,7 +442,6 @@ claude mcp add --scope user jsfind-mcp -- jsfind-mcp
 
 | 启动方式 | 生成的命令 |
 |---|---|
-| `pip install jsfind-mcp` | `jsfind-mcp`（PATH） |
 | `python -m jsfind_mcp.server` | `<python> -m jsfind_mcp.server` |
 | 打包二进制 | 绝对路径（含空格自动加引号） |
 
