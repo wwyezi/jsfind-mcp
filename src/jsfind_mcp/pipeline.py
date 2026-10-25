@@ -18,14 +18,31 @@ dragging on. Only GET is ever sent: the collection phase stays read-only.
 from __future__ import annotations
 
 import asyncio
+import codecs
+import functools
 import hashlib
+import math
+import queue
 import re
+import threading
+import time
+from concurrent.futures import Executor, Future
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlencode, urljoin, urlparse
 
 from .analyze import Engine, ResourceRef
 from .banner import BannerEngine
+from .chunking import (
+    AST_MAX_BYTES,
+    REJECT_MAX_BYTES,
+    body_bytes,
+    PIECE_OVERLAP,
+    PieceCutter,
+    is_rejected,
+    split_by_lines,
+    wants_ast,
+)
 from .collect import Client, Response, offline_response
 from .config import Config
 from .discover import (
@@ -98,6 +115,11 @@ _MAX_RESPONSE_FIELDS = 80
 #: something this tool should do.
 _MAX_MANIFEST_PROBES = 12
 _MAX_SPEC_PROBES = 12
+#: Wall clock for one probe request. A well-known path that answers and then
+#: never finishes (no Content-Length, connection held open) would otherwise
+#: cost the full read-gap timeout per attempt — a dozen guesses at that price
+#: silently eat a whole scan budget.
+_PROBE_TIMEOUT = 6.0
 #: Cap on operations expanded from one specification document.
 _MAX_SPEC_OPERATIONS = 300
 #: An extractor crash is reported, not swallowed, but a pathological target
@@ -115,6 +137,82 @@ _NON_HTTP_SCHEMES = frozenset({"ws", "wss"})
 #: and view scripts these passes uncover are one layer down from what the first
 #: pass already found, so they should not get a second full target timeout.
 _EXPANSION_BUDGET = 120.0
+
+
+class SerialWorker(Executor):
+    """One daemon thread that runs submitted callables, one at a time.
+
+    A plain :class:`ThreadPoolExecutor` is the wrong shape here twice over: its
+    threads are non-daemon and the interpreter joins them at exit, so a scan
+    still extracting when the client closes stdin keeps the process alive as an
+    orphan — which is what a pile of half-dead ``jsfind-mcp.exe`` instances
+    looks like from the outside. A daemon thread dies with the process, and a
+    single worker keeps extraction strictly sequential so the shared result is
+    mutated by one thread at a time, exactly as when it ran inline.
+    """
+
+    def __init__(self, name: str = "jsfind-extract"):
+        self._jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            fn, args, kwargs, future = job
+            if future.set_running_or_notify_cancel():
+                try:
+                    future.set_result(fn(*args, **kwargs))
+                except BaseException as exc:  # noqa: BLE001 - carried to the awaiter
+                    future.set_exception(exc)
+
+    def submit(self, fn, /, *args, **kwargs) -> Future:
+        future = Future()
+        self._jobs.put((fn, args, kwargs, future))
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        self._jobs.put(None)
+        if wait:
+            self._thread.join(timeout=1.0)
+
+
+class Budget:
+    """The wall-clock budget one whole scan has to finish in.
+
+    ``target_timeout`` used to bound only the first queue drain: manifest
+    probing, route rendering, spec probing and endpoint probing then ran with no
+    ceiling at all. Against a real target that adds up to far longer than an
+    MCP client waits before it gives up and closes the stdio pipe -- which takes
+    the server process, and with it the in-memory result, down with no error
+    anywhere. One deadline now covers every phase, and each phase spends what is
+    left of it or stops early and says so.
+
+    Zero means unlimited, matching how the other configured limits read.
+    """
+
+    def __init__(self, seconds: float):
+        self._unlimited = not seconds or seconds <= 0
+        self._start = time.monotonic()
+        self._deadline = self._start + seconds if not self._unlimited else math.inf
+
+    def left(self) -> float:
+        """Seconds still available. ``inf`` when no limit was configured."""
+        if self._unlimited:
+            return math.inf
+        return max(0.0, self._deadline - time.monotonic())
+
+    def expired(self) -> bool:
+        return self.left() <= 0
+
+    def timeout(self) -> float | None:
+        """``left()`` in the form ``asyncio.wait_for`` takes it: None means wait."""
+        return None if self._unlimited else self.left()
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self._start
 
 _CATEGORY_ORDER = {
     "app_server": 0,
@@ -139,6 +237,98 @@ class InlineItem:
     def __post_init__(self) -> None:
         if not self.source_url:
             self.source_url = self.url
+
+
+
+class _OverflowExtractor:
+    """Sliding-window extraction over the part of a body past the cap.
+
+    A 20 MB bundle capped at 10 MB used to lose every interface in its back
+    half. This consumer is handed each streamed byte as it arrives, keeps a
+    rolling window cut like :func:`split_by_lines`, and runs the same passes
+    ``_extract_piece`` runs — minus the AST — over each completed piece. The
+    window starts a little before the cap (``PIECE_OVERLAP``) so a match
+    straddling the cut is seen whole by one piece; the merge sets collapse the
+    double hit against the prefix pass.
+
+    Line numbers stay absolute: the window's line counter is seeded with the
+    newlines of the retained prefix. The vendor decision comes from the same
+    head region ``is_third_party_bundle`` reads in the batch path, so a
+    library bundle is skipped here exactly as it is there.
+    """
+
+    #: Head bytes kept for the vendor decision; matches the license scanner.
+    _SNIFF_BYTES = 200_000
+
+    def __init__(self, pipeline: "Pipeline", item, scope, queue, result,
+                 cap: int):
+        self._pipeline = pipeline
+        self._item = item
+        self._source_url = item.url
+        self._scope = scope
+        self._queue = queue
+        self._result = result
+        self._start = max(0, cap - PIECE_OVERLAP)
+        self._pos = 0
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._head = ""
+        self._head_lines = 0
+        self._cutter: PieceCutter | None = None
+        self._overflow_seen = False
+        self._tail = ""
+
+    async def feed(self, data: bytes) -> None:
+        start, end = self._pos, self._pos + len(data)
+        self._pos = end
+        if end <= self._start:
+            self._note_head(self._decoder.decode(data))
+            return
+        if start < self._start:
+            self._note_head(
+                self._decoder.decode(data[: self._start - start]))
+            data = data[self._start - start:]
+        if self._cutter is None:
+            self._begin_window()
+        text = self._decoder.decode(data)
+        if text:
+            self._overflow_seen = True
+            self._tail = (self._tail + text)[-4096:]
+            for piece in self._cutter.feed(text):
+                await self._extract(piece)
+
+    def _note_head(self, text: str) -> None:
+        if not text:
+            return
+        self._head_lines += text.count("\n")
+        if len(self._head) < self._SNIFF_BYTES:
+            self._head += text[: self._SNIFF_BYTES - len(self._head)]
+
+    def _begin_window(self) -> None:
+        vendor = is_third_party_bundle(self._head)
+        skip = bool(vendor and
+                    self._pipeline.config.scope.skip_library_bundles)
+        self._cutter = PieceCutter(initial_lines=self._head_lines)
+        self._vendor = vendor
+        self._skip = skip
+
+    async def _extract(self, piece: str) -> None:
+        await self._pipeline._offload(
+            self._pipeline._extract_overflow_piece,
+            self._source_url, piece, self._vendor, self._skip, self._item,
+            self._scope, self._queue, self._result)
+
+    async def finish(self, response: Response) -> None:
+        if self._cutter is not None:
+            for piece in self._cutter.flush():
+                await self._extract(piece)
+        # The sourceMappingURL comment sits at the very end of a bundle —
+        # in the overflow region of a truncated download. Re-checking the
+        # tail here is what keeps source map recovery alive past the cap.
+        if (self._overflow_seen and self._tail
+                and self._pipeline.config.scope.probe_source_maps):
+            await self._pipeline._offload(
+                self._pipeline._absorb_map_reference, self._item, self._tail,
+                self._result, self._queue)
 
 
 class Pipeline:
@@ -177,6 +367,32 @@ class Pipeline:
         self._source_cache: dict[str, str] = {}
         self._js_dir: Path | None = None
         self._entry: Response | None = None
+        #: Set per run, so every phase draws from the same clock. Unlimited by
+        #: default so a phase reached outside run() is never cut short by a
+        #: budget that was never configured.
+        self._budget = Budget(0.0)
+        #: One worker for the extraction passes. Regex and Tree-sitter over a
+        #: whole bundle are seconds of synchronous CPU each, and running them
+        #: inline starves the event loop — which serves every other MCP request,
+        #: including ``tools/list``. A single thread keeps the passes strictly
+        #: sequential, so they mutate shared state exactly as they did when they
+        #: ran inline; the loop is just no longer hostage to them. Daemon, so a
+        #: scan still running at exit cannot hold the process open.
+        self._worker = SerialWorker()
+
+    def close(self) -> None:
+        self._worker.shutdown(wait=False)
+
+    async def _offload(self, fn, *args, **kwargs):
+        """Run one extraction pass on the worker thread.
+
+        Every caller of this holds no lock and touches ``result`` only after
+        the await returns, so the sequential single worker is enough to keep
+        the shared state as safe as it was when the pass ran inline.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._worker, functools.partial(fn, *args, **kwargs))
 
     # -- entry point ----------------------------------------------------
 
@@ -205,23 +421,30 @@ class Pipeline:
 
         client = Client(self.config, getattr(target, "headers", None),
                         getattr(target, "cookies", None))
+        self._budget = Budget(self.config.request.target_timeout)
         async with client:
             try:
                 await asyncio.wait_for(
                     self._drain(queue, client, scope, result, root_url),
-                    timeout=self.config.request.target_timeout,
+                    timeout=self._budget.timeout(),
                 )
             except asyncio.TimeoutError:
-                result.issues.append(Issue(
-                    code="target_timeout", stage="collect", url=root_url,
-                    message=f"达到单目标超时 {self.config.request.target_timeout:.0f}s，"
-                            "已停止收集并返回已获得的结果。",
-                ))
-            await self._expand_manifests(client, scope, result, queue, root_url)
-            await self._settle(queue, client, scope, result, root_url)
-            await self._crawl_routes(client, scope, result, root_url)
-            await self._expand_openapi(client, scope, result, root_url)
-            await self._probe_endpoints(client, scope, result)
+                pass
+            # Every later phase shares what is left of the same deadline, and
+            # skips itself entirely once it is gone: either something ran out
+            # here, or there was nothing left worth waiting for.
+            if not self._budget.expired():
+                await self._expand_manifests(client, scope, result, queue, root_url)
+            if not self._budget.expired():
+                await self._settle(queue, client, scope, result, root_url)
+            if not self._budget.expired():
+                await self._crawl_routes(client, scope, result, root_url)
+            if not self._budget.expired():
+                await self._expand_openapi(client, scope, result, root_url)
+            if not self._budget.expired():
+                await self._probe_endpoints(client, scope, result)
+            if self._budget.expired():
+                self._budget_note(result, root_url)
 
         self._publish_hosts(result)
         result.graphql = list(self._graphql.values())
@@ -230,6 +453,25 @@ class Pipeline:
         if self._recovered_count:
             result.hints.insert(0, f"source map 还原出 {self._recovered_count} "
                                     f"个原始源码文件，已保存并可检索。")
+
+    def _budget_note(self, result: Result, root_url: str) -> None:
+        """Say plainly that this scan stopped early, once.
+
+        A partial scan looks exactly like a small site if nobody says otherwise,
+        and "no endpoints here" is the wrong thing for a model to conclude from
+        a run that ran out of time before looking.
+        """
+        if any(issue.code == "target_timeout" for issue in result.issues):
+            return
+        limit = self.config.request.target_timeout
+        result.issues.append(Issue(
+            code="target_timeout", stage="collect", url=root_url,
+            message=f"达到单目标超时 {limit:.0f}s（耗时 "
+                    f"{self._budget.elapsed():.0f}s），已停止后续阶段并"
+                    "返回已获得的结果。要扫得更完整，用 jsfind_scan 的 "
+                    "timeout_seconds 提高预算，或关掉 crawl_routes / "
+                    "probe_endpoints 减少请求数。",
+        ))
 
     # -- queue ----------------------------------------------------------
 
@@ -298,7 +540,17 @@ class Pipeline:
 
     async def _fetch_entry(self, item, client: Client, scope: Scope,
                            result: Result, queue: Queue) -> None:
-        response = await client.get(item.url, allow_redirect=scope.can_fetch)
+        extractor = self._overflow_consumer(item, scope, queue, result)
+        response = await client.get(
+            item.url, allow_redirect=scope.can_fetch,
+            on_chunk=extractor.feed if extractor else None)
+        if extractor is not None:
+            await extractor.finish(response)
+        await self._offload(self._absorb_entry, item, response, scope,
+                            result, queue)
+
+    def _absorb_entry(self, item, response: Response, scope: Scope,
+                      result: Result, queue: Queue) -> None:
         self._entry = response
         if response.error:
             result.issues.append(Issue(
@@ -306,10 +558,11 @@ class Pipeline:
                 message=response.error, retryable=True,
             ))
             return
+        self._note_truncation(item.url, response, result)
         result.resources.append(Resource(
             url=item.url, type=ResourceType.DOCUMENT,
             status_code=response.status_code, content_type=response.content_type,
-            size=len(response.body), depth=0, final_url=response.final_url,
+            size=response.size, depth=0, final_url=response.final_url,
         ))
         self._record_scan_host(item.url)
         self._absorb_banner(response)
@@ -322,8 +575,22 @@ class Pipeline:
     async def _fetch_one(self, item, client: Client, scope: Scope,
                          queue: Queue, result: Result,
                          semaphore: asyncio.Semaphore) -> None:
+        extractor = self._overflow_consumer(item, scope, queue, result)
         async with semaphore:
-            response = await client.get(item.url, allow_redirect=scope.can_fetch)
+            response = await client.get(
+                item.url, allow_redirect=scope.can_fetch,
+                on_chunk=extractor.feed if extractor else None)
+        if extractor is not None:
+            await extractor.finish(response)
+        await self._offload(self._absorb_one, item, response, scope, queue,
+                            result)
+
+    def _absorb_one(self, item, response: Response, scope: Scope,
+                    queue: Queue, result: Result) -> None:
+        # Everything from here on touches the shared result, the queue and the
+        # pipeline's own seen-sets. It runs as one unit on the single worker so
+        # that stays strictly sequential, exactly as it was when this all ran
+        # inline on the event loop — only the network I/O is left there.
         if response.error:
             result.issues.append(Issue(
                 code="fetch_failed", stage="collect", url=item.url,
@@ -331,6 +598,7 @@ class Pipeline:
             ))
             return
 
+        self._note_truncation(item.url, response, result)
         self._absorb_banner(response)
 
         if response.is_source_map():
@@ -343,7 +611,7 @@ class Pipeline:
             result.resources.append(Resource(
                 url=item.url, type=self._resource_type(item.kind),
                 source_url=item.source_url, status_code=response.status_code,
-                content_type=response.content_type, size=len(response.body),
+                content_type=response.content_type, size=response.size,
                 depth=item.depth,
             ))
             return
@@ -352,7 +620,7 @@ class Pipeline:
         result.resources.append(Resource(
             url=item.url, type=self._resource_type(item.kind),
             source_url=item.source_url, status_code=response.status_code,
-            content_type=response.content_type, size=len(response.body),
+            content_type=response.content_type, size=response.size,
             depth=item.depth,
             local_path=self._save_js(item.url, body) or "",
         ))
@@ -362,6 +630,47 @@ class Pipeline:
             self._absorb_script(item, response, body, queue, scope, result)
         elif item.kind == Kind.SCRIPT:
             self._absorb_document(item.url, response, queue, scope, result)
+
+    def _note_truncation(self, url: str, response: Response,
+                         result: Result) -> None:
+        """Record that a body was cut short by the response-size cap.
+
+        The capped prefix is still analyzed and still saved, so the inventory
+        stays useful; what must not happen is the caller mistaking a 10 MB
+        prefix of a 20 MB bundle for the whole file. When the sliding-window
+        extractor covered the overflow, say so — what the caller should do
+        next depends on what the truncation actually cost.
+        """
+        if not response.truncated:
+            return
+        limit = max(0, int(self.config.request.max_response_bytes))
+        kept = len(response.body)
+        declared = (f"服务端声明 {response.declared_size} 字节"
+                    if response.declared_size >= 0 else "服务端未声明长度")
+        coverage = ("溢出部分已过滑动窗口正则提取，接口/密钥不受截断影响；"
+                    if response.overflow_analyzed else
+                    "接口与敏感信息仅覆盖保留的前缀。")
+        if len(result.issues) < _MAX_COLLECTION_ISSUES:
+            result.issues.append(Issue(
+                code="response_truncated", stage="collect", url=url,
+                message=(f"响应体超过 max_response_bytes={limit} 字节上限，"
+                         f"保留前 {kept} 字节（全量 {response.size} 字节，"
+                         f"{declared}）；" + coverage +
+                         "AST 与全文检索只覆盖保留的前缀。"),
+                retryable=False,
+            ))
+        if response.overflow_analyzed:
+            hint = (f"{url} 响应超过 {limit} 字节上限被截断（保留前 {kept} 字节，"
+                    f"全量 {response.size} 字节）；正则提取已覆盖全量。"
+                    "AST/jsfind_js_search 只覆盖保留的前缀；需要对后半段做"
+                    "AST 级分析时调高 max_response_bytes，或手工切片后用"
+                    " jsfind_analyze_file。")
+        else:
+            hint = (f"{url} 响应超过 {limit} 字节上限被截断（保留前 {kept} 字节）；"
+                    "需要完整内容时对感兴趣区域手工切片后用 jsfind_analyze_file 分析，"
+                    "或单次调用 jsfind_scan 时调高 max_response_bytes。")
+        if hint not in self._hints:
+            self._hints.append(hint)
 
     # -- documents ------------------------------------------------------
 
@@ -461,7 +770,13 @@ class Pipeline:
 
     def _absorb_script(self, item, response: Response, body: str, queue: Queue,
                        scope: Scope, result: Result) -> None:
-        """Run every extractor over one script body."""
+        """Run every extractor over one script body.
+
+        A body past the chunk limit is cut on line boundaries and extracted a
+        piece at a time. The pieces share this pipeline's seen-sets, so the
+        merged outcome is the same as one whole-body pass would have produced,
+        without the minutes of CPU that pass costs on a 23 MB bundle.
+        """
         source_url = item.url
         self._source_cache[source_url] = body
         vendor = is_third_party_bundle(body)
@@ -470,12 +785,39 @@ class Pipeline:
         # for them (in which case their results are tagged vendor).
         skip = vendor and self.config.scope.skip_library_bundles
 
+        if is_rejected(body):
+            self._hints.append(
+                f"{source_url} 体积 {body_bytes(body)} 字节超过 "
+                f"{REJECT_MAX_BYTES} 上限，未做提取；请切出感兴趣区域后分析。")
+            return
+
         findings: list = []
         params: list = []
         hosts: list = []
         base_paths: list = []
         candidates: list = []
+        ast = wants_ast(body)
+        if not ast and not skip:
+            self._hints.append(
+                f"{source_url} 超过 {AST_MAX_BYTES} 字节，跳过 AST 解析，"
+                "仅做正则提取。")
 
+        for piece in split_by_lines(body):
+            self._extract_piece(source_url, piece, ast, skip, candidates,
+                                findings, params, hosts, base_paths, result)
+
+        self._merge_extracted(source_url, vendor, candidates, findings,
+                              params, hosts, base_paths, queue, scope, result)
+
+        # 4. source maps: a leaked map restores the whole unminified front end.
+        if self.config.scope.probe_source_maps:
+            self._absorb_map_reference(item, body, result, queue)
+
+    def _extract_piece(self, source_url: str, body: str, ast: bool,
+                       skip: bool, candidates: list, findings: list,
+                       params: list, hosts: list, base_paths: list,
+                       result: Result) -> None:
+        """The extraction passes themselves, run over one piece of one body."""
         # 1. regex pass — always runs; it is the only pass for libraries.
         regex_result = from_javascript(source_url, body, self.engine)
         findings.extend(regex_result.findings)
@@ -491,7 +833,7 @@ class Pipeline:
                 result.spa.merge(regex_result.spa)
 
         # 2. AST pass — API calls with methods, request shapes and base paths.
-        if not skip:
+        if not skip and ast:
             ast_result = analyze_js(source_url, body,
                                     max_bytes=self.config.limits.max_ast_bytes)
             candidates.extend(ast_result.candidates)
@@ -536,6 +878,16 @@ class Pipeline:
                 if text not in self._hints:
                     self._hints.append(text)
 
+    def _merge_extracted(self, source_url: str, vendor: bool,
+                         candidates: list, findings: list, params: list,
+                         hosts: list, base_paths: list,
+                         queue: Queue, scope: Scope, result: Result) -> None:
+        """Fold one extraction pass's outputs into the shared result.
+
+        Shared by the whole-body script path and the sliding-window overflow
+        path so both merge identically — same vendor tagging, same
+        de-duplication, same routing.
+        """
         for candidate in candidates:
             candidate.vendor = vendor
             self._route_resource(candidate, source_url, queue, scope, result)
@@ -553,9 +905,41 @@ class Pipeline:
             if path not in self._base_paths and len(self._base_paths) < _MAX_BASE_PATHS:
                 self._base_paths.append(path)
 
-        # 4. source maps: a leaked map restores the whole unminified front end.
-        if self.config.scope.probe_source_maps:
-            self._absorb_map_reference(item, body, result, queue)
+    def _overflow_consumer(self, item, scope: Scope, queue: Queue,
+                           result: Result):
+        """The sliding-window consumer for one fetch, or None to skip it.
+
+        Only script-shaped fetches get one: a document's markup is read whole
+        from the kept prefix, and a body that fits under the cap never
+        overflows — the batch pass over it is already complete.
+        """
+        limit = max(0, int(self.config.request.max_response_bytes))
+        if not limit:
+            return None
+        if not (item.kind in (Kind.SCRIPT, Kind.CHUNK)
+                or is_javascript_path(item.url)):
+            return None
+        return _OverflowExtractor(self, item, scope, queue, result, limit)
+
+    def _extract_overflow_piece(self, source_url: str, piece: str,
+                                vendor: bool, skip: bool, item, scope,
+                                queue, result) -> None:
+        """One sliding-window piece of an over-cap body, on the worker.
+
+        The same passes ``_extract_piece`` runs, minus the AST: parsing is
+        what the AST cutoff already withholds from large bodies, and the
+        window's job is recall — every regex the batch path runs sees every
+        byte here.
+        """
+        candidates: list = []
+        findings: list = []
+        params: list = []
+        hosts: list = []
+        base_paths: list = []
+        self._extract_piece(source_url, piece, False, skip, candidates,
+                            findings, params, hosts, base_paths, result)
+        self._merge_extracted(source_url, vendor, candidates, findings,
+                              params, hosts, base_paths, queue, scope, result)
 
     def _absorb_map_reference(self, item, body: str, result: Result,
                               queue: Queue) -> None:
@@ -586,7 +970,7 @@ class Pipeline:
         result.resources.append(Resource(
             url=item.url, type=ResourceType.SOURCEMAP,
             source_url=item.source_url, status_code=response.status_code,
-            content_type=response.content_type, size=len(response.body),
+            content_type=response.content_type, size=response.size,
             depth=item.depth,
         ))
         self._record_scan_host(item.url, item.source_url)
@@ -750,14 +1134,19 @@ class Pipeline:
                       result: Result, root_url: str) -> None:
         """Drain what an expansion pass queued, under a smaller budget.
 
-        The first pass gets the target's whole timeout. Later passes only fetch
-        what the earlier ones made visible, so they get a slice of it and say so
-        if they could not finish, rather than silently returning a partial view
-        of the target.
+        The later passes only fetch what the earlier ones made visible, so they
+        get a slice of what the target's whole budget has left and say so if
+        they could not finish, rather than silently returning a partial view.
         """
         if not len(queue):
             return
-        budget = min(self.config.request.target_timeout, _EXPANSION_BUDGET)
+        if self._budget.expired():
+            self._hints.append("预算已耗尽，扩展阶段加入的资源未再继续获取。")
+            return
+        if self._budget.left() < _EXPANSION_BUDGET:
+            budget = self._budget.left()
+        else:
+            budget = _EXPANSION_BUDGET
         try:
             await asyncio.wait_for(
                 self._drain(queue, client, scope, result, root_url),
@@ -819,23 +1208,21 @@ class Pipeline:
         added = 0
         found: list[dict] = []
         for url in targets[:_MAX_MANIFEST_PROBES]:
+            # Checked per candidate rather than once: 12 requests against a slow
+            # origin is how this phase turns into minutes.
+            if self._budget.expired():
+                self._hints.append("预算已耗尽，资源清单只探测了一部分。")
+                break
             if not scope.can_fetch(url):
                 continue
             try:
-                response = await client.get(url)
+                response = await client.get(url, timeout=_PROBE_TIMEOUT)
             except Exception:  # noqa: BLE001 - an unreachable guess is not a failure
                 continue
             if not response.ok or not response.is_textual():
                 continue
-            manifest = parse_manifest(url, self._decode(response))
-            if not manifest.files and not manifest.notes:
-                continue
-            found.append(manifest.to_dict())
-            self._record_scan_host(url, root_url)
-            for name in manifest.scripts():
-                resolved = resolve_url(url, name)
-                if resolved and queue.push(resolved, Kind.CHUNK, url, depth=2):
-                    added += 1
+            added += await self._offload(self._absorb_manifest, url, response,
+                                         queue, root_url, found)
         result.assets.extend(found)
         if found:
             self._hints.append(
@@ -871,6 +1258,11 @@ class Pipeline:
                             max_items=self.config.limits.max_resources)
         rendered = 0
         for route, concrete in pairs:
+            # Rendering is one GET plus a full extraction pass per route, so the
+            # deadline is checked before every single one.
+            if self._budget.expired():
+                route.note = "预算耗尽，未渲染"
+                continue
             url = urljoin(root_url, concrete)
             if not scope.can_fetch(url):
                 route.note = "不在采集范围内"
@@ -887,18 +1279,8 @@ class Pipeline:
             if not response.is_textual():
                 route.note = "非文本响应，无懒加载脚本"
                 continue
-            result.resources.append(Resource(
-                url=url, type=ResourceType.ROUTE,
-                status_code=response.status_code,
-                content_type=response.content_type, size=len(response.body),
-                depth=1, final_url=response.final_url,
-            ))
-            self._record_scan_host(url, root_url)
-            self._absorb_banner(response)
-            self._last_route_candidates = []
-            self._absorb_document(url, response, route_queue, scope, result)
-            self._credit_route(route, url)
-            route.rendered = True
+            await self._offload(self._absorb_route, route, url, response,
+                                route_queue, scope, result, root_url)
             rendered += 1
 
         # Published after the loop: the table records what each render pulled
@@ -910,6 +1292,68 @@ class Pipeline:
                 "（GET，只读，未携带凭据）。"
             )
         await self._settle(route_queue, client, scope, result, root_url)
+
+    def _absorb_spec(self, url: str, response: Response, result: Result,
+                     root_url: str) -> None:
+        """Read one published API specification and record its operations."""
+        spec = parse_spec(url, self._decode(response))
+        if not spec and not spec.notes:
+            return
+        result.specs.append(spec.to_dict())
+        self._record_scan_host(url, root_url)
+        if spec:
+            self._add_spec_operations(spec, result)
+
+    def _absorb_manifest(self, url: str, response: Response, queue: Queue,
+                         root_url: str, found: list) -> int:
+        """Read one manifest and queue the scripts it names. Returns how many."""
+        manifest = parse_manifest(url, self._decode(response))
+        if not manifest.files and not manifest.notes:
+            return 0
+        found.append(manifest.to_dict())
+        self._record_scan_host(url, root_url)
+        added = 0
+        for name in manifest.scripts():
+            resolved = resolve_url(url, name)
+            if resolved and queue.push(resolved, Kind.CHUNK, url, depth=2):
+                added += 1
+        return added
+
+    def _absorb_probe(self, endpoint: Endpoint, response: Response) -> None:
+        """Record what one GET probe learned about an endpoint."""
+        endpoint.status_code = response.status_code
+        endpoint.signal = classify_status(response.status_code)
+        # A 200 with a business failure code is not a success. The
+        # operator tells us what their codes mean; the status line
+        # alone cannot tell them.
+        business = self._business_signal(response.text)
+        if business:
+            endpoint.signal = business
+        # An interface often lives on a different stack than the site
+        # itself (a PHP front end proxying a Tomcat API), so probing is a
+        # second chance to learn the real middleware.
+        self._absorb_banner(response)
+        if response.ok and "json" in response.media_type():
+            endpoint.response_params = json_field_names(response.text)[
+                :_MAX_RESPONSE_FIELDS
+            ]
+
+    def _absorb_route(self, route: Route, url: str, response: Response,
+                      route_queue: Queue, scope: Scope, result: Result,
+                      root_url: str) -> None:
+        """Record one rendered route and pull in what its document exposed."""
+        result.resources.append(Resource(
+            url=url, type=ResourceType.ROUTE,
+            status_code=response.status_code,
+            content_type=response.content_type, size=response.size,
+            depth=1, final_url=response.final_url,
+        ))
+        self._record_scan_host(url, root_url)
+        self._absorb_banner(response)
+        self._last_route_candidates = []
+        self._absorb_document(url, response, route_queue, scope, result)
+        self._credit_route(route, url)
+        route.rendered = True
 
     def _credit_route(self, route: Route, url: str) -> None:
         """Record what rendering one path uniquely pulled in."""
@@ -938,21 +1382,19 @@ class Pipeline:
                                                       SPEC_PATHS, root_url)
                    if self._host_is_target(url, root_url)]
         for url in targets[:_MAX_SPEC_PROBES]:
+            if self._budget.expired():
+                self._hints.append("预算已耗尽，接口规范只探测了一部分。")
+                break
             if not scope.can_probe(url):
                 continue
             try:
-                response = await client.get(url)
+                response = await client.get(url, timeout=_PROBE_TIMEOUT)
             except Exception:  # noqa: BLE001 - an unreachable guess is not a failure
                 continue
             if not response.ok or not response.is_textual():
                 continue
-            spec = parse_spec(url, self._decode(response))
-            if not spec and not spec.notes:
-                continue
-            result.specs.append(spec.to_dict())
-            self._record_scan_host(url, root_url)
-            if spec:
-                self._add_spec_operations(spec, result)
+            await self._offload(self._absorb_spec, url, response, result,
+                                root_url)
 
     def _add_spec_operations(self, spec, result: Result) -> None:
         """Write declared operations into the endpoint table.
@@ -1014,30 +1456,32 @@ class Pipeline:
 
         async def probe(endpoint: Endpoint) -> None:
             try:
-                response = await client.get(endpoint.url)
+                response = await client.get(endpoint.url, timeout=_PROBE_TIMEOUT)
             except Exception:  # noqa: BLE001 - a failed probe is not a scan failure
                 return
-            endpoint.status_code = response.status_code
-            endpoint.signal = classify_status(response.status_code)
-            # A 200 with a business failure code is not a success. The
-            # operator tells us what their codes mean; the status line
-            # alone cannot tell them.
-            business = self._business_signal(response.text)
-            if business:
-                endpoint.signal = business
-            # An interface often lives on a different stack than the site
-            # itself (a PHP front end proxying a Tomcat API), so probing is a
-            # second chance to learn the real middleware.
-            self._absorb_banner(response)
-            if response.ok and "json" in response.media_type():
-                endpoint.response_params = json_field_names(response.text)[
-                    :_MAX_RESPONSE_FIELDS
-                ]
+            await self._offload(self._absorb_probe, endpoint, response)
 
+        probed = 0
         for start in range(0, total, batch_size):
+            # The most expensive phase by request count, and the easiest to leave
+            # unfinished: everything already collected stays valid without it.
+            if self._budget.expired():
+                self._hints.append(
+                    f"预算已耗尽，{total - probed}/{total} 个接口未做 GET 探测"
+                    "（signal 保持 unprobed）。")
+                break
             batch = targets[start:start + batch_size]
-            await asyncio.gather(*(probe(item) for item in batch),
-                                 return_exceptions=True)
+            # Each batch is capped by what is left, so one slow endpoint cannot
+            # carry the batch past the deadline.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(probe(item) for item in batch),
+                                   return_exceptions=True),
+                    timeout=self._budget.timeout(),
+                )
+            except asyncio.TimeoutError:
+                pass  # the next iteration sees an expired budget and stops
+            probed += len(batch)
 
     # -- merging --------------------------------------------------------
 

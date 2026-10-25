@@ -14,6 +14,7 @@ jsfind-mcp-js/
 # these two is to carry the absolute path of *this* installation so a client
 # config can be pasted as-is. They are regenerated on launch, never committed.
 mcp.json
+.deadlock-check.log
 MCP-CONFIG.md
 
 # PyInstaller writes its analysis log into the cwd it was run from.

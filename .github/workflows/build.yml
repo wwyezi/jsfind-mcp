@@ -1,0 +1,95 @@
+name: build
+
+# PyInstaller cannot cross-compile: a Linux binary has to be produced on Linux.
+# This workflow is the answer to that on a Windows dev box -- push, and the
+# runner builds both platforms and attaches them to the run.
+#
+# Triggers:
+#   * push to main     -> build both, keep as workflow artifacts (7 days)
+#   * tag v*           -> build both and attach to a GitHub Release
+#   * manual dispatch  -> build both on demand
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - name: unit tests
+        run: python tests/test_banners.py
+      - name: verification suites
+        run: |
+          for script in verify_expansion verify_tools verify_banners \
+                        verify_jsdir verify_proxy verify_offline verify_mcpconfig; do
+            echo "=== $script ==="
+            python "devtools/$script.py"
+          done
+
+  build:
+    name: build (windows)
+    needs: tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      - name: build
+        run: python -m PyInstaller --clean --noconfirm --distpath dist --workpath build packaging/jsfind_mcp.spec
+
+      - name: smoke test
+        shell: bash
+        run: |
+          ./dist/jsfind-mcp.exe --print-config > /dev/null
+          ./dist/jsfind-mcp.exe --help > /dev/null
+
+      - name: smoke test the MCP transport
+        shell: bash
+        run: python devtools/verify_frozen.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jsfind-mcp-windows
+          path: dist/jsfind-mcp.exe
+          if-no-files-found: error
+
+  release:
+    name: attach binaries to the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/jsfind-mcp-windows/jsfind-mcp.exe
+          fail_on_unmatched_files: true

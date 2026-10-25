@@ -108,11 +108,23 @@ def _run_checks() -> int:
               run(server_argv() + ["--print-config"]).stdout)
 
         print("\n3. startup writes config files")
-        out = run(server_argv() + ["--write-config", cfg_dir])
+        # stderr is a pipe here, not a terminal: the block is diverted to the
+        # diagnostic log so an MCP client that never reads the pipe cannot
+        # deadlock the server on a full buffer.
+        log_path = os.path.join(tmp, "server.log")
+        env = dict(child_env())
+        env["JSFIND_LOG"] = log_path
+        out = subprocess.run(server_argv() + ["--write-config", cfg_dir],
+                             capture_output=True, text=True, timeout=300,
+                             env=env, errors="replace")
         check("exit code 0", out.returncode == 0, out.stderr[-300:])
         check("stdout clean for JSON-RPC", out.stdout.strip() == "",
               repr(out.stdout[:120]))
-        check("config block on stderr", "mcpServers" in out.stderr)
+        check("stderr quiet (nothing to block on)", out.stderr.strip() == "",
+              repr(out.stderr[:120]))
+        logged = open(log_path, encoding="utf-8").read() \
+            if os.path.isfile(log_path) else ""
+        check("config block in the diagnostic log", "mcpServers" in logged)
 
         json_path = os.path.join(cfg_dir, "mcp.json")
         md_path = os.path.join(cfg_dir, "MCP-CONFIG.md")

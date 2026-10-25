@@ -61,7 +61,25 @@ def _duration(value: Any, fallback: float) -> float:
 @dataclass
 class RequestConfig:
     timeout: float = 15.0
-    target_timeout: float = 300.0
+    #: Wall-clock budget for one whole scan, every phase included, not just the
+    #: first queue drain. It is deliberately short for an interactive caller: an
+    #: MCP client gives up on a tool that blocks for minutes and closes the
+    #: stdio pipe, which takes the server process -- and every in-memory result
+    #: -- with it. Raise it per call with jsfind_scan's ``timeout_seconds``, or
+    #: in config, when a target genuinely needs longer. 0 means unlimited.
+    target_timeout: float = 90.0
+    #: Ceiling on one response body, counted after decompression. The body is
+    #: fetched streaming and cut at the cap, so a 20 MB bundle costs one capped
+    #: read instead of filling memory before any check ever sees it. The first
+    #: 10 MB of a bundle holds essentially every endpoint and secret the rest
+    #: would repeat; the cap is raised per call via jsfind_scan. 0 means
+    #: unlimited -- and hands the target a way to exhaust the scan's memory.
+    max_response_bytes: int = 10 * 1024 * 1024
+    #: Wall-clock ceiling on one request including its whole body transfer.
+    #: httpx's own ``read`` timeout only bounds the gap between two reads, so a
+    #: server that dribbles bytes just under the gap streams forever and pins
+    #: one fetch slot for the remainder of the scan. 0 means unlimited.
+    download_timeout: float = 30.0
     retry: int = 1
     #: Outbound proxy for every request. Accepts a bare host:port (assumed
     #: http) or a full URL, optionally with credentials. Never echoed back
@@ -177,6 +195,7 @@ _SECTIONS = {
 _DURATION_FIELDS = {
     ("request", "timeout"),
     ("request", "target_timeout"),
+    ("request", "download_timeout"),
 }
 
 

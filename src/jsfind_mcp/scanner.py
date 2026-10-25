@@ -83,6 +83,8 @@ class Scanner:
                 code="collection_failed", stage="collect", url=result.target,
                 message=f"{type(exc).__name__}: {exc}",
             ))
+        finally:
+            pipeline.close()
 
         result.finished_at = _now()
         result.statistics = _statistics(result)

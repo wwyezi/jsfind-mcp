@@ -179,6 +179,19 @@ async def run() -> None:
           any("WebSocket" in c for c in coverage.get("caveats", [])),
           str(coverage.get("caveats"))[:160])
 
+    print("\n[call hygiene: a timeout that is not a number]")
+    # A model forwarding an operator's config sends whatever it saw there, and
+    # a bare env-var name is the common case. That must cost a default budget,
+    # not the call: a strict-typed client rejects it before it is even sent,
+    # which surfaces as "the tools vanished".
+    bad = await call("jsfind_scan", url=base,
+                     timeout_seconds="REQUEST_TIMEOUT")
+    check("non-numeric timeout does not fail the call",
+          bool(bad.get("scan_id")), str(bad)[:160])
+    check("falls back to the configured default budget",
+          float(bad.get("timeout_seconds", 0)) > 0,
+          str(bad.get("timeout_seconds")))
+
     server.shutdown()
 
 

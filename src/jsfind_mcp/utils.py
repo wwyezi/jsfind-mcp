@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 
 import bisect
+from datetime import datetime
+from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from .model import ContextLine
@@ -337,3 +339,264 @@ def use_utf8_stdio() -> None:
             reconfigure(encoding="utf-8", errors="replace")
         except (ValueError, OSError):  # pragma: no cover - redirected streams
             pass
+
+
+#: Where stderr went, so ``jsfind_diagnostics`` can say it out loud. Empty when
+#: stderr was left on the terminal it was given.
+DIAGNOSTIC_LOG: Path | None = None
+
+
+def _windows_process_tree() -> dict:
+    """``pid -> parent pid`` for every running process, via Toolhelp32."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    TH32CS_SNAPPROCESS = 0x2
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot in (0, -1, None):
+        return {}
+    try:
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        table: dict = {}
+        more = kernel32.Process32First(snapshot, ctypes.byref(entry))
+        while more:
+            table[entry.th32ProcessID] = entry.th32ParentProcessID
+            more = kernel32.Process32Next(snapshot, ctypes.byref(entry))
+        return table
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+
+def _ancestors() -> list:
+    """Every process above us in the tree, nearest first.
+
+    Only the *immediate* parent is not enough. A client that launches through a
+    short-lived wrapper — a shell, a launcher, a supervisor helper — has that
+    wrapper die within seconds while the client itself keeps using the server.
+    Watching just the parent turns that into a suicide pact: the server kills a
+    perfectly healthy session and the client, seeing a dead pipe, starts
+    another. Walking the whole chain and requiring *all* of it to be gone is
+    what "the client is actually gone" looks like.
+    """
+    import os
+
+    try:
+        parent = os.getppid()
+    except (AttributeError, OSError):  # pragma: no cover - exotic hosts
+        return []
+    if parent in (0, 1):
+        return []
+
+    chain = [parent]
+    if os.name == "nt":
+        table = _windows_process_tree()
+        seen = {parent}
+        pid = table.get(parent, 0)
+        while pid and pid not in seen:
+            chain.append(pid)
+            seen.add(pid)
+            pid = table.get(pid, 0)
+    return chain
+
+
+def watch_parent(interval: float = 15.0) -> None:
+    """Exit once every process above us has gone away.
+
+    An MCP client that crashes or is killed can leave its stdio children behind:
+    the pipe is gone but nothing told the child to stop, so it sits there
+    holding its scans until someone notices the pile.
+
+    Two things this deliberately gets wrong in the safe direction:
+
+    * it watches the whole ancestor chain, not just the immediate parent, so a
+      short-lived launcher dying mid-session does not kill a healthy server;
+    * it requires two consecutive readings of "everyone is gone" and logs the
+      decision first, so a transient lookup failure cannot fire it and a
+      forensic trail exists when it does.
+
+    The check is a daemon thread — it must never be the reason the process
+    cannot exit.
+    """
+    import os
+    import threading
+    import time
+
+    chain = _ancestors()
+    if not chain:
+        return
+
+    def alive(pid: int) -> bool:
+        if os.name == "nt":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            # 0x1000 = PROCESS_QUERY_LIMITED_INFORMATION, the least demanding
+            # right there is. A NULL handle here can mean "no such process" or
+            # "not permitted"; GetLastError is what separates them, and only
+            # the former counts as dead.
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return kernel32.GetLastError() != 87  # ERROR_INVALID_PARAMETER
+            try:
+                code = ctypes.c_uint()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True  # cannot tell: assume it lives
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True  # EPERM and friends: it is there
+        return True
+
+    def watch() -> None:
+        strikes = 0
+        while True:
+            time.sleep(interval)
+            if any(alive(pid) for pid in chain):
+                strikes = 0
+                continue
+            strikes += 1
+            if strikes < 2:
+                continue
+            # _exit, not exit: nothing here is worth flushing at the cost of
+            # hanging on a stuck stream, and the point is to go away. Say so
+            # first, because a silent exit is indistinguishable from a crash.
+            try:
+                import sys
+                print(f"jsfind-mcp: 客户端进程链 {chain} 已全部退出，"
+                      "本进程随之结束。", file=sys.stderr, flush=True)
+            except Exception:  # noqa: BLE001
+                pass
+            os._exit(0)
+
+    threading.Thread(target=watch, name="jsfind-parent-watch",
+                     daemon=True).start()
+
+
+def count_siblings() -> int:
+    """How many jsfind-mcp processes are running, this one included.
+
+    Reported rather than enforced: a hard single-instance lock would refuse a
+    second workspace its own server, and would make a client's restart collide
+    with its own shutdown. Telling the operator "there are four of me" is the
+    part that actually helps.
+    """
+    import os
+    import subprocess
+
+    name = "jsfind-mcp"
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {name}.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10, errors="replace")
+            return sum(1 for line in out.stdout.splitlines()
+                       if line.strip().startswith(f'"{name}'))
+        out = subprocess.run(["pgrep", "-f", name], capture_output=True,
+                             text=True, timeout=10, errors="replace")
+        return len([line for line in out.stdout.splitlines() if line.strip()])
+    except Exception:  # noqa: BLE001 - a missing tool is not a failure
+        return 0
+
+#: One log per session would grow without bound on a long-lived install, so the
+#: previous one is kept and the current file starts over past this size.
+_MAX_LOG_BYTES = 2 * 1024 * 1024
+
+
+def redirect_diagnostics() -> Path | None:
+    """Point stderr at a log file instead of at whatever the caller piped.
+
+    An MCP client is free to ignore the stderr pipe it handed us. A scan logs
+    every request through httpx and every tool call through FastMCP, so an
+    unread pipe fills within one tool call, the write blocks, and the whole
+    server stops answering — including ``tools/list``, which is why the client
+    then shows an empty tool list until the process is restarted. A file write
+    cannot block like that, so the transport stays responsive no matter what
+    the caller does with stderr.
+
+    The swap is done on file descriptor 2 rather than on ``sys.stderr`` alone:
+    logging handlers, Rich and anything else that captured the stream at import
+    time keep writing to that descriptor, and after ``dup2`` every one of them
+    lands in the log.
+
+    Returns the log file, or ``None`` when stderr is a terminal and was left
+    alone — an operator watching a console wants the output where they are.
+    """
+    import os
+    import sys
+    import tempfile
+
+    global DIAGNOSTIC_LOG
+
+    try:
+        if sys.stderr is not None and sys.stderr.isatty():
+            return None
+    except (ValueError, OSError):  # pragma: no cover - closed streams
+        pass
+
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except (ValueError, OSError):  # pragma: no cover
+        pass
+
+    log_path: Path | None = None
+    handle = None
+    try:
+        override = os.environ.get("JSFIND_LOG", "").strip()
+        if override:
+            # Operator's choice, and what a test uses to stay off the real log.
+            log_path = Path(override).expanduser()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            from .resources import user_config_dir
+
+            log_dir = user_config_dir() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "server.log"
+        if log_path.exists() and log_path.stat().st_size > _MAX_LOG_BYTES:
+            log_path.replace(log_path.with_suffix(log_path.suffix + ".1"))
+        handle = open(log_path, "a", encoding="utf-8", errors="replace")
+    except OSError:
+        # Even a dead end is better than the pipe: writes to devnull never
+        # block, which is the property this function exists for.
+        handle = open(os.devnull, "w", encoding="utf-8")
+        log_path = None
+
+    try:
+        os.dup2(handle.fileno(), 2)
+    except OSError:  # pragma: no cover - exotic hosts
+        sys.stderr = handle
+        DIAGNOSTIC_LOG = log_path
+        return log_path
+
+    # sys.stderr still wraps fd 2, which now names the log file, so Python
+    # writes and captured-stream writes both end up there. Append mode keeps
+    # the two file positions from interleaving badly.
+    handle.close()
+    DIAGNOSTIC_LOG = log_path
+    if log_path is not None:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n=== jsfind-mcp diagnostics {stamp} ===", file=sys.stderr,
+              flush=True)
+    return log_path

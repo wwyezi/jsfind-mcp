@@ -6,7 +6,19 @@ mode: auto
 
 request:
   timeout: 15s
-  target_timeout: 5m
+  # 一次扫描的总墙钟预算，覆盖全部阶段（收集、资源清单、路由渲染、接口规范、
+  # 接口探测），而不是只限定第一轮下载。默认刻意压到 90s：工具阻塞几分钟后
+  # MCP 客户端会放弃并断开 stdio 管道，进程一退，内存里的扫描结果也一起没了。
+  # 目标确实需要更久时，用 jsfind_scan 的 timeout_seconds 单次提高，或改这里。
+  # 0 表示不限制。
+  target_timeout: 90s
+  # 单个响应体的大小上限（字节，按解压后计）。超限响应流式读取、截断保留前缀，
+  # 并返回 issues[].code="response_truncated"；不再把 20MB+ 返回包整包读进内存。
+  # 需要更深区域时用 jsfind_scan 的 max_response_bytes 单次调高。0 表示不限制。
+  max_response_bytes: 10485760
+  # 单个请求的总墙钟上限（秒），覆盖连接与整个响应体的传输；httpx 的 read
+  # 超时只限两次读取的间隔，慢速滴流可无限拖住一个并发槽。0 表示不限制。
+  download_timeout: 30s
   retry: 1
   # Outbound proxy for every request. A bare "host:port" is treated as http.
   # Credentials may be included but are never echoed back to a caller.

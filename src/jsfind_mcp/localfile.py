@@ -28,6 +28,14 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .analyze import Engine
+from .chunking import (
+    AST_MAX_BYTES,
+    REJECT_MAX_BYTES,
+    body_bytes,
+    is_rejected,
+    split_by_lines,
+    wants_ast,
+)
 from .collect import offline_response
 from .config import Config
 from .discover import (
@@ -341,10 +349,40 @@ def _absorb(result: Result, engine: Engine, config: Config, pseudo_url: str,
             body: str, finding_keys: set, param_keys: set,
             endpoint_keys: set, base_paths: list, hints: list,
             local: LocalResult, resolved: bool, base: str = "") -> None:
-    """Run every extractor over one body and merge the outcome."""
+    """Run every extractor over one body and merge the outcome.
+
+    A body past the chunk limit is cut on line boundaries and fed through the
+    extractors a piece at a time. The pieces share the caller's seen-sets, so
+    what comes out is merged and deduplicated exactly as if the whole body had
+    been analyzed in one go — just without the minutes of CPU that one go costs
+    on a 23 MB bundle. Line numbers survive the cut: each piece is padded with
+    the newlines before it.
+    """
+    if is_rejected(body):
+        local.skipped.append(
+            f"{pseudo_url}（文件过大：{body_bytes(body)} 字节 > "
+            f"{REJECT_MAX_BYTES}，请切出感兴趣区域后分块分析）")
+        return
     vendor = is_third_party_bundle(body)
     skip = vendor and config.scope.skip_library_bundles
+    ast = wants_ast(body)
+    if not ast and not skip:
+        hints.append(
+            f"{pseudo_url} 超过 {AST_MAX_BYTES} 字节，已跳过 AST 解析，"
+            "仅做正则提取。")
 
+    for piece in split_by_lines(body):
+        _absorb_piece(result, engine, config, pseudo_url, piece, ast, skip,
+                      vendor, finding_keys, param_keys, endpoint_keys,
+                      base_paths, hints, local, resolved, base)
+
+
+def _absorb_piece(result: Result, engine: Engine, config: Config,
+                  pseudo_url: str, body: str, ast: bool, skip: bool,
+                  vendor: bool, finding_keys: set, param_keys: set,
+                  endpoint_keys: set, base_paths: list, hints: list,
+                  local: LocalResult, resolved: bool, base: str) -> None:
+    """One piece of one body: the extractors themselves, unchunked."""
     regex_result = from_javascript(pseudo_url, body, engine)
     _merge_findings(result, regex_result.findings, finding_keys, vendor)
     # Hosts were never collected offline: _statistics reported hosts=0
@@ -364,7 +402,7 @@ def _absorb(result: Result, engine: Engine, config: Config, pseudo_url: str,
         _merge_params(result, regex_result.params, param_keys, vendor)
         base_paths.extend(base_path_names(regex_result.base_paths))
 
-    if not skip:
+    if not skip and ast:
         for candidate in analyze_js(pseudo_url, body).candidates:
             _add_candidate(result, candidate, pseudo_url, base, endpoint_keys)
         limit = config.limits.max_resources or 20_000
@@ -378,7 +416,9 @@ def _absorb(result: Result, engine: Engine, config: Config, pseudo_url: str,
         for candidate in candidates:
             candidate.vendor = vendor
             _add_candidate(result, candidate, pseudo_url, base, endpoint_keys)
-        _merge_params(result, params_from_ast(pseudo_url, body), param_keys, vendor)
+        if ast:
+            _merge_params(result, params_from_ast(pseudo_url, body), param_keys,
+                          vendor)
 
         # Non-HTTP transports and the route table sit outside every call shape
         # the passes above understand. Without them the offline path reports

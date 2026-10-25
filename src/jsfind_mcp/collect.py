@@ -9,11 +9,14 @@ report shows the real address rather than the one the code referenced.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from .chunking import REJECT_MAX_BYTES
 from .config import Config
 from .proxy import bypass_hosts, mounts_for, normalize, ProxyError
 from .utils import normalize_url
@@ -33,6 +36,11 @@ _TEXTUAL_EXACT = frozenset({
 })
 _SCRIPT_SUFFIXES = (".js", ".mjs", ".jsx", ".ts", ".tsx")
 
+#: Streaming read granularity. Small enough that a decompression bomb's
+#: expansion is noticed within one chunk of hitting the cap, large enough that
+#: per-chunk overhead is noise even for hundreds of responses.
+_READ_CHUNK = 64 * 1024
+
 
 @dataclass
 class Response:
@@ -49,10 +57,29 @@ class Response:
     error: str = ""
     redirected: bool = False
     redirect_to: str = ""
+    #: True when the retained body is only a prefix of the full response —
+    #: cut short by the response-size cap or by the reject ceiling. The prefix
+    #: is still analyzed in full (AST included), but downstream passes must
+    #: not treat it as the whole file.
+    truncated: bool = False
+    #: Content-Length as declared by the server, or -1 when absent/chunked.
+    declared_size: int = -1
+    #: Total decompressed bytes the transfer actually carried, even when
+    #: ``body`` kept only the prefix. -1 when nothing was streamed.
+    streamed_size: int = -1
+    #: True when the bytes past the cap were still run through the sliding-
+    #: window extractor, so regex-level findings cover the whole transfer
+    #: even though ``body`` holds only the prefix.
+    overflow_analyzed: bool = False
 
     @property
     def ok(self) -> bool:
         return not self.error and 200 <= self.status_code < 400
+
+    @property
+    def size(self) -> int:
+        """The response's real size: what was streamed, not what was kept."""
+        return self.streamed_size if self.streamed_size >= 0 else len(self.body)
 
     @property
     def text(self) -> str:
@@ -157,18 +184,33 @@ class Client:
             self._client = None
 
     async def get(self, url: str, follow: bool = True,
-                  allow_redirect=None) -> Response:
+                  allow_redirect=None,
+                  timeout: float | None = None,
+                  on_chunk=None) -> Response:
         """Fetch one URL, following redirects while they remain allowed.
 
         ``allow_redirect`` is a predicate the scope controller supplies; a
         redirect it rejects stops the chain instead of leaving the target.
+
+        ``timeout`` overrides the transfer wall clock for this one request.
+        The probe passes use it: a well-known path that answers and then never
+        finishes (no Content-Length, connection held open) costs the configured
+        read-gap timeout per attempt, and a scan probing ten of those must not
+        spend a bundle-sized budget on them.
+
+        ``on_chunk`` is an async consumer of the decompressed body bytes, in
+        stream order. It is handed every chunk of the final (non-redirect)
+        response regardless of the retention cap — that is how the sliding-
+        window extractor reaches the part of a 20 MB bundle the kept prefix
+        cannot. Time spent inside the consumer is refunded to the transfer
+        wall clock: that clock bounds the network, not our own analysis.
         """
         await self.start()
         target = normalize_url(url)
         current = target
         hops = self.config.request.max_redirects if follow else 0
         for hop in range(hops + 1):
-            response = await self._once(current)
+            response = await self._once(current, timeout, on_chunk)
             if not response.redirected or hop >= hops:
                 return response
             location = response.redirect_to
@@ -180,38 +222,150 @@ class Client:
             current = location
         return Response(url=target, error="too many redirects")
 
-    async def _once(self, url: str) -> Response:
+    async def _once(self, url: str, timeout: float | None = None,
+                    on_chunk=None) -> Response:
         attempts = max(1, self.config.request.retry + 1)
         last = Response(url=url, final_url=url)
         for attempt in range(attempts):
             try:
-                assert self._client is not None
-                raw = await self._client.get(url)
+                last = await self._fetch_streaming(url, timeout, on_chunk)
             except httpx.TooManyRedirects:
-                last = Response(url=url, final_url=url, error="too many redirects")
-                return last
+                return Response(url=url, final_url=url, error="too many redirects")
+            except httpx.TimeoutException as exc:
+                # ReadTimeout and kin: the server was slow once; an immediate
+                # retry just reads slowly twice. Connection-level failures in
+                # the branch below are the ones an attempt can fix.
+                return Response(url=url, final_url=url,
+                                error=f"{type(exc).__name__}: {exc}")
             except httpx.HTTPError as exc:
                 last = Response(url=url, final_url=url,
                                 error=f"{type(exc).__name__}: {exc}")
                 if attempt + 1 < attempts:
                     await asyncio.sleep(0.3 * (attempt + 1))
                 continue
-            last = Response(
-                url=url,
-                final_url=str(raw.url),
-                status_code=raw.status_code,
-                content_type=raw.headers.get("content-type", ""),
-                body=raw.content,
-                headers={name.lower(): value
-                         for name, value in raw.headers.items()},
-            )
-            if 300 <= raw.status_code < 400:
-                last.redirected = True
-                location = raw.headers.get("location", "")
-                if location:
-                    last.redirect_to = urljoin(str(raw.url), location)
+            except asyncio.TimeoutError:
+                # Not an httpx error: this is our own wall clock on the whole
+                # transfer. A server streaming one byte just under httpx's
+                # read-gap timeout would otherwise hold a fetch slot forever,
+                # because that timeout bounds the gap between reads, never the
+                # transfer itself. Retrying cannot beat the same wall.
+                seconds = (timeout if timeout and timeout > 0
+                           else self.config.request.download_timeout)
+                return Response(url=url, final_url=url,
+                                error=f"download timeout after {seconds:g}s")
             return last
         return last
+
+    async def _fetch_streaming(self, url: str,
+                               timeout: float | None = None,
+                               on_chunk=None) -> Response:
+        """Fetch one URL with the body read in bounded pieces.
+
+        ``client.get()`` buffers the entire response before returning, so a
+        20 MB bundle (or a gzip bomb, or a chunked body with no length at all)
+        lands whole in memory before any size check could run — the same
+        memory-exhaustion shape that gets crawler clients CVE'd. Here the body
+        is streamed in chunks, counted after decompression, and the retained
+        ``body`` stops at ``max_response_bytes``: the first cap bytes of a
+        bundle carry nearly every interface it has. With an ``on_chunk``
+        consumer the stream itself continues past the cap (up to the reject
+        ceiling) so the consumer sees every byte, and the read stops there.
+        """
+        limit = max(0, int(self.config.request.max_response_bytes))
+        started = time.monotonic()
+        assert self._client is not None
+        wall = timeout if timeout is not None and timeout > 0 else None
+        request_timeout = httpx.Timeout(wall) if wall else None
+        loop = asyncio.get_running_loop()
+        effective_wall = wall if wall else self.config.request.download_timeout
+        deadline = (loop.time() + effective_wall
+                    if effective_wall and effective_wall > 0 else None)
+        async with self._time_download(wall) as clock:
+            async with self._client.stream("GET", url,
+                                           timeout=request_timeout) as raw:
+                response = Response(
+                    url=url,
+                    final_url=str(raw.url),
+                    status_code=raw.status_code,
+                    content_type=raw.headers.get("content-type", ""),
+                    headers={name.lower(): value
+                             for name, value in raw.headers.items()},
+                )
+                declared = raw.headers.get("content-length")
+                if declared is not None:
+                    try:
+                        response.declared_size = int(declared)
+                    except ValueError:
+                        pass
+                # The cap applies after decompression, so the declared length
+                # is advisory only: a chunked body has none, and a compressed
+                # one can expand far past it. Whatever the headers claim, the
+                # first cap bytes are read and kept — for a bundle that prefix
+                # carries nearly every interface — and the consumer, when
+                # present, is handed the rest as it streams by. A redirect hop
+                # or a binary body feeds nobody: one is not the resource, the
+                # other is not text to extract from.
+                feed = None
+                if (on_chunk is not None and response.is_textual()
+                        and not (300 <= raw.status_code < 400)):
+                    feed = on_chunk
+                chunks: list[bytes] = []
+                kept = 0
+                total = 0
+                stopped_early = False
+                async for chunk in raw.aiter_bytes(_READ_CHUNK):
+                    if feed is not None:
+                        tick = loop.time()
+                        await feed(chunk)
+                        # Our own analysis must not count against the network
+                        # budget, or a big bundle would be cut off mid-download
+                        # for being expensive to read.
+                        if deadline is not None and clock is not None:
+                            deadline += loop.time() - tick
+                            clock.reschedule(deadline)
+                    total += len(chunk)
+                    if limit and kept < limit:
+                        take = chunk[: limit - kept]
+                        chunks.append(take)
+                        kept += len(take)
+                    elif not limit:
+                        chunks.append(chunk)
+                        kept += len(chunk)
+                    if feed is None and limit and kept >= limit:
+                        stopped_early = True
+                        break
+                    if total >= REJECT_MAX_BYTES:
+                        stopped_early = True
+                        break
+                body = b"".join(chunks)
+                if limit and len(body) > limit:
+                    body = body[:limit]
+                response.body = body
+                response.streamed_size = total
+                # Truncated means the retained body is not the whole story:
+                # either the stream really ran past it, or the read stopped
+                # at the cap / ceiling where more may well have been waiting.
+                response.truncated = stopped_early or total > kept
+                response.overflow_analyzed = bool(feed) and total > (limit or 0)
+                if 300 <= raw.status_code < 400:
+                    response.redirected = True
+                    location = raw.headers.get("location", "")
+                    if location:
+                        response.redirect_to = urljoin(str(raw.url), location)
+                response.elapsed = time.monotonic() - started
+                return response
+
+    def _time_download(self, seconds: float | None = None):
+        """A wall-clock context over the whole transfer.
+
+        ``None`` means the configured ``download_timeout``; a positive value
+        overrides it; zero means unlimited.
+        """
+        limit = (self.config.request.download_timeout
+                 if seconds is None else seconds)
+        if limit and limit > 0:
+            return asyncio.timeout(limit)
+        return contextlib.nullcontext()
 
 
 def offline_response(url: str, body: str, content_type: str = "text/html") -> Response:

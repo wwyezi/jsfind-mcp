@@ -1,5 +1,7 @@
 # jsfind-mcp
 
+
+
 > **免责声明 / Disclaimer**
 >
 > 本项目是**攻防安全测试的辅助工具**，不是攻击工具，也不包含任何利用、绕过或
@@ -101,7 +103,7 @@ pip install .
 
 | 工具                  | 作用                                                         |
 | --------------------- | ------------------------------------------------------------ |
-| `jsfind_scan`         | 扫描一个目标，返回 `scan_id`；可用 `js_dir` 指定脚本落盘目录、`save_js=false` 完全不落盘、`proxy` 指定出站代理 |
+| `jsfind_scan`         | 扫描一个目标，返回 `scan_id`；可用 `js_dir` 指定脚本落盘目录、`save_js=false` 完全不落盘、`proxy` 指定出站代理、`max_response_bytes` 限制单响应大小（`"20MB"` 也接受，超出截断保留前缀） |
 | `jsfind_analyze_file` | **离线**分析本地 JS/HTML/目录，不发起任何网络请求            |
 | `jsfind_diagnostics`  | 报告当前安装**能做什么、不能做什么**（AST 是否可用、规则是否完整） |
 
@@ -431,6 +433,72 @@ AI 看到 `403` 和 `404` 若没有语义标注，只能靠猜，而且通常往
 启动时会打印可直接粘贴的配置，并写一份 `mcp.json` 到当前目录。
 输出走 **stderr**——stdio 传输下 stdout 被 JSON-RPC 占用。
 
+### stderr 不是终端时改写日志文件
+
+被 MCP 客户端拉起时 stderr 是一条**管道**，而客户端常常根本不读它。扫描过程里
+httpx 每个请求、FastMCP 每次调用都往 stderr 写日志，管道一满，进程就阻塞在
+这条写入上，`tools/list` 再也收不到回应——表现就是**工具列表突然变空，重启
+才恢复**。所以 stderr 不是终端时，全部诊断输出改写到日志文件，绝不碰管道：
+
+| 情况 | 行为 |
+|---|---|
+| 交互终端运行（`isatty`） | 照旧打印到 stderr |
+| 被客户端拉起（管道） | 写入 `~/.jsfind-mcp/logs/server.log`，超过 2MB 轮转一份 `.1` |
+| 设了 `JSFIND_LOG` 环境变量 | 写到该路径（测试与自定义位置用） |
+
+日志路径可从 `jsfind_diagnostics` 的 `diagnostic_log` 字段拿到。
+**`mcp.json` / `MCP-CONFIG.md` 是配置的权威副本**，stderr 那段只是给人看的。
+需要证明这一点：`python devtools/deadlock_check.py`。
+
+### 扫描不会拖死整个会话
+
+MCP 服务端是 asyncio 单循环，`tools/list` 和所有工具调用共用它。提取
+（正则 + Tree-sitter 跑整个 bundle）是秒级同步 CPU 重活，早先直接跑在循环上，
+一个大号压缩文件就把 `tools/list` 一起冻住——工具列表变空、必须重启，说的就是
+这件事。现在提取跑在专用工作线程上，网络 I/O 留在循环上，扫描进行中
+`tools/list` 照常应答。验证：`python devtools/responsive_check.py`。
+
+### 大文件分块、缓存与进程治理
+
+- **分块提取**：超过 `JSFIND_MAX_CHUNK_BYTES`（默认 700KB）的 bundle 按行边界
+  切块，逐块跑提取器后用既有去重集合合并；每块补上前面的换行，行号仍然指向
+  整个文件里的正确位置。超过 `JSFIND_AST_MAX_BYTES`（默认 5MB）跳过 AST 只做
+  正则，超过 `JSFIND_REJECT_MAX_BYTES`（默认 50MB）直接拒绝并提示切片。
+- **扫描缓存**：`ScanStore` 最多保留 20 条（`JSFIND_MAX_SCANS`）、每条 600 秒
+  过期（`JSFIND_SCAN_CACHE_TTL`），超限淘汰最旧；`jsfind_release` 可立即释放
+  单条或全部。`jsfind_sensitive` 支持 `offset` 分页。
+- **进程治理**：提取线程是 daemon，stdio 读循环结束立即 `os._exit(0)`，父进程
+  消失时看门狗主动退出——三条一起保证客户端关掉后不留下孤儿实例。
+  `jsfind_diagnostics` 的 `instances_running` 会报告当前有几个实例（只报告不
+  拒绝：硬互斥会误伤多工作区与客户端重启）。
+- **路由与探测解耦**：`jsfind_scan` 新增 `crawl_routes` / `max_resources` 参数；
+  目标本身是 JS 文件时自动跳过路由渲染（没有路由可走，白耗预算）。
+- **超时结构化**：超时返回 `code:"timeout"` + `partial:true`，`timeout_seconds`
+  始终是数字且夹在 `3600` 以内。
+
+### 超大响应：滑动窗口提取全量，内存只留前缀
+
+返回包超过 `request.max_response_bytes`（默认 10MB）时不再整包读进内存：
+
+- **保留前缀**：前 10MB 留在内存里做 AST 与全文分析（bundle 前缀几乎承载全部
+  接口与密钥）；
+- **滑动窗口覆盖全量**：上限之外的字节边下载边过提取窗口（按行切块、块间重叠
+  4KB、窗口起点前移 4KB，跨界匹配不丢），正则/密钥/chunk 发现与整包分析是
+  **同一套提取**——接口与密钥的召回不受截断影响；
+- 结果里如实标注：`issue.code="response_truncated"` 注明保留字节数与全量字节数；
+  hint 说明「正则已覆盖全量、AST/jsfind_js_search 只覆盖前缀」，以及后半段要做
+  AST 级分析的两种途径（调高 `max_response_bytes` / 手工切片
+  `jsfind_analyze_file`）；
+- `jsfind_scan` 可用 `max_response_bytes` 覆盖（`"20MB"` 这类写法也接受）。
+
+代价与边界：窗口提取是 CPU 活（20MB bundle 实测约 2 分钟），默认
+`target_timeout` 90s 下大目标会先返回已提取部分并标 `target_timeout`——建议
+大目标传 `timeout_seconds: 300`。`sourceMappingURL` 恒在文件末尾，截断场景由
+窗口尾部兜住，source map 还原仍然可用。
+
+慢速滴流的传输由 `request.download_timeout`（默认 30s，`0` 不限）整包墙钟兜底，
+到点即断并返回 `download timeout`。验证：`python devtools/response_limit_check.py`。
+
 > `mcp.json` 与 `MCP-CONFIG.md` 里是**你这台机器的绝对路径**（这正是它们的价值：
 > 粘进客户端就能用）。它们每次启动都会重新生成，已在 `.gitignore` 中，
 > **不要提交或转发**。要分享配置请用 `examples/mcp.json` 里的 PATH 形式。
@@ -485,7 +553,9 @@ claude mcp add --scope user jsfind-mcp -- jsfind-mcp
 ```yaml
 request:
   timeout: 15s
-  target_timeout: 5m
+  target_timeout: 90s
+  max_response_bytes: 10485760   # 单个响应保留上限（解压后计），超出截断保留前缀
+  download_timeout: 30s          # 单响应整包传输墙钟；0 不限
   proxy: ""                 # 出站代理；裸 host:port 视为 http
   no_proxy: ""               # 逗号分隔，绕过代理的主机
   trust_env: true            # 采纳 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY
@@ -509,6 +579,23 @@ banners_file: ""         # 自定义版本号规则；留空用内置规则集
 上面 5 个**顶层键**（`js_dir` / `save_js` / `request_template` / `rules_file` /
 `banners_file`）与 `request` / `concurrency` / `limits` / `scope` 四个区块都会被
 读取。`save_js: false` 是你要把凭据留在磁盘之外时的那个开关，请确认它生效。
+
+### 一次扫描的墙钟预算
+
+`target_timeout` 限制的是**整次扫描**：第一个阶段（下载 queue）之后还要跑资源清单、
+路由渲染、接口规范、接口探测，它们共用同一个截止时刻，谁先到点后面就跳过，而不是各自
+无限进行。默认值压到 90s，原因是一条工具的调用如果阻塞好几分钟，MCP 客户端会先放弃、
+断开 stdio 管道——进程一退，内存里的扫描结果也一起消失，这正是「工具用着用着就没了、
+必须重启」的来源。目标确实需要更久时：
+
+```jsonc
+{ "url": "https://target.example", "timeout_seconds": 300 }
+```
+
+预算耗尽时不会假装扫完了：结果里带 `issue.code="target_timeout"` 说明为什么停，
+`jsfind_scan` 返回 `timed_out: true`，路由表里未渲染的条目标注「预算耗尽，未渲染」，
+未探测的接口保持 `signal="unprobed"`。`target_timeout: 0` 表示不限制。
+验证：`python devtools/verify_budget.py`。
 
 **关掉扩展阶段**（只想做纯静态分析、把请求数压到最低）：
 
@@ -624,6 +711,11 @@ tests/               # 单测与本地靶场
 | `devtools/verify_frozen.py`    | 打包后的二进制能真的跑                                       |
 | `devtools/verify_offline.py`   | 离线结果的查询与概览层：surface 不抛异常、authorized 有意义、diff 找得到遗漏 |
 | `devtools/verify_proxy.py`     | 起一个真实转发代理，验证流量确实经过它、密码不回显、`no_proxy` 与 `trust_env` 真的生效 |
+| `devtools/verify_budget.py`    | 一次扫描会在墙钟预算处停下并返回已得结果，而不是跑下去直到客户端断开 |
+| `devtools/deadlock_check.py`   | 客户端不读 stderr 管道时服务仍能应答（工具列表不会静默消失） |
+| `devtools/responsive_check.py` | 大 bundle 扫描进行中 `tools/list` 仍有响应、取消与坏消息不会杀死会话 |
+| `devtools/chunk_check.py`      | 大文件按行分块提取、跨块去重合并、AST 与拒绝阈值生效         |
+| `devtools/lifecycle_check.py`  | 扫描缓存 LRU+TTL 与显式释放、纯 JS 目标跳过路由渲染、超时结构化返回 |
 | `devtools/probe_gaps.py`       | 探测现有规则集的覆盖盲区                                     |
 
 ## 生态

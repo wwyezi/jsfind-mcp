@@ -26,7 +26,11 @@ also serve streamable HTTP for remote or shared setups.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import functools
 import json
+import os
+import time
 import re
 import sys
 import threading
@@ -58,7 +62,9 @@ from .jssearch import collect_js_files, search
 from .surface import build_surface
 from .rules import regex_backend
 from .scanner import Scanner, Target
-from .utils import use_utf8_stdio
+from . import utils as _utils
+from .pipeline import SerialWorker
+from .utils import is_javascript_path
 
 SERVER_NAME = "jsfind-mcp"
 SERVER_VERSION = "0.1.0"
@@ -66,50 +72,112 @@ SERVER_VERSION = "0.1.0"
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 1000
 
+#: Ceiling on a per-call scan budget. A model that asks for a day gets this and
+#: is told so: an unbounded wait is worse than a partial answer, because the
+#: client gives up on the call and the tools disappear with it.
+MAX_TIMEOUT_SECONDS = 3600.0
+
+#: Where CPU-heavy tool bodies run instead of on the event loop. Daemon, so a
+#: body still working at exit cannot hold the process open as an orphan.
+_CPU = SerialWorker()
+
+
+async def _offload(fn, /, *args, **kwargs):
+    """Run ``fn`` on the CPU worker, off the event loop."""
+    return await asyncio.get_running_loop().run_in_executor(
+        _CPU, functools.partial(fn, *args, **kwargs))
+
+
+#: How many finished scans are held at once. Past this the oldest is dropped
+#: so a long session cannot grow without bound -- a Result holds every endpoint
+#: and finding of a whole target, and a handful of big targets is hundreds of
+#: megabytes.
+DEFAULT_MAX_SCANS = 20
+#: How long a scan stays addressable, in seconds. An id that has gone stale
+#: answers "unknown" rather than returning a result nobody is still working
+#: from, which is the difference between a stale answer and a clear one.
+DEFAULT_SCAN_TTL = 600.0
+
 
 class ScanStore:
     """Keeps finished scans addressable by a short id.
 
     In-memory on purpose: results hold live credentials, and writing them to a
-    shared directory by default would be the wrong default.
+    shared directory by default would be the wrong default. Bounded on purpose
+    too: ``max_scans`` entries, each expiring after ``ttl`` seconds, so a long
+    session releases what it collected instead of holding all of it.
     """
 
     #: Every id carries the run it came from. Without it, "scan-1" from the
     #: run before a restart and "scan-1" from the run after are different scans
     #: with the same name, and a tester reading the old id gets back a result
     #: that is silently not theirs.
-    def __init__(self, base_config: Config | None = None):
+    def __init__(self, base_config: Config | None = None,
+                 max_scans: int = DEFAULT_MAX_SCANS,
+                 ttl: float = DEFAULT_SCAN_TTL):
         self._lock = threading.Lock()
         self._next = 0
-        self._scans: dict[str, Result] = {}
+        self._scans: dict[str, tuple] = {}  # id -> (put_at, Result)
         self.base = base_config
         self.session = uuid4().hex[:6]
+        self.max_scans = max(1, int(max_scans or DEFAULT_MAX_SCANS))
+        self.ttl = float(ttl or DEFAULT_SCAN_TTL)
 
     def put(self, result: Result) -> str:
         with self._lock:
             self._next += 1
             scan_id = f"scan-{self.session}-{self._next}"
-            self._scans[scan_id] = result
+            self._scans[scan_id] = (time.monotonic(), result)
+            self._evict_locked()
             return scan_id
 
     def get(self, scan_id: str) -> Result:
         with self._lock:
-            result = self._scans.get(scan_id)
-        if result is None:
+            entry = self._scans.get(scan_id)
+            if entry is not None and self._expired_locked(entry):
+                del self._scans[scan_id]
+                entry = None
+        if entry is None:
             raise KeyError(
                 f"unknown scan_id {scan_id!r}. Scans live in memory only and are "
-                f"gone once the server restarts, so an id from an earlier run "
-                f"cannot be resolved here. This run's session is {self.session}; "
-                f"live ids: {sorted(self._scans)[:20]}. Re-run jsfind_scan or "
+                f"gone once the server restarts or the entry ages out "
+                f"({self.ttl:.0f}s), so an id from an earlier run cannot be "
+                f"resolved here. This run's session is {self.session}; "
+                f"live ids: {sorted(self.ids())[:20]}. Re-run jsfind_scan or "
                 f"jsfind_analyze_file to get an id from the current run."
             )
-        return result
+        return entry[1]
 
     def ids(self) -> list[str]:
         with self._lock:
+            self._evict_locked()
             # Ids are "scan-<session>-<n>"; the counter is the last segment.
             # Sorting on the session segment would raise ValueError on it.
             return sorted(self._scans, key=lambda key: int(key.rsplit("-", 1)[-1]))
+
+    def release(self, scan_id: str) -> bool:
+        """Drop one scan now. True when something was actually dropped."""
+        with self._lock:
+            return self._scans.pop(scan_id, None) is not None
+
+    def clear(self) -> int:
+        """Drop every scan. Returns how many went."""
+        with self._lock:
+            count = len(self._scans)
+            self._scans.clear()
+            return count
+
+    def _expired_locked(self, entry: tuple) -> bool:
+        return time.monotonic() - entry[0] > self.ttl
+
+    def _evict_locked(self) -> None:
+        """Drop expired entries, then the oldest until under the cap."""
+        for scan_id in [sid for sid, entry in self._scans.items()
+                        if self._expired_locked(entry)]:
+            del self._scans[scan_id]
+        while len(self._scans) > self.max_scans:
+            oldest = min(self._scans, key=lambda sid: self._scans[sid][0])
+            del self._scans[oldest]
 
 
 #: Short names that mean something specific to a tester, so a minifier
@@ -172,8 +240,11 @@ def build_server(store: ScanStore):
         url: str,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
-        timeout_seconds: int = 0,
+        timeout_seconds: int | str = 0,
         probe: bool = True,
+        crawl_routes: bool | None = None,
+        max_resources: int = 0,
+        max_response_bytes: int | str = 0,
         js_dir: str = "",
         save_js: bool = True,
         proxy: str = "",
@@ -192,9 +263,31 @@ def build_server(store: ScanStore):
             url: target URL, e.g. https://example.com
             headers: extra request headers, e.g. Authorization
             cookies: session cookies from an authenticated session
-            timeout_seconds: per-target timeout (default 300)
+            timeout_seconds: wall-clock budget for this whole scan, all phases
+                included (default 90). Collection stops when it is spent and
+                returns what it has, rather than running on until the MCP
+                client gives up and drops the connection. Raise it for a target
+                that needs longer; a scan that returns timed_out=true was cut
+                short, and the rest of this result is a partial view. Accepts a
+                number or a numeric string ("300"); anything else falls back to
+                the default rather than failing the call.
             probe: confirm discovered endpoints with read-only GET probes
                 (default true). Turn off for a purely passive collection run.
+            crawl_routes: render each front-end route to reach the scripts it
+                loads on demand. Default is the config value, and is forced
+                off for a target that is itself a JavaScript file — a single
+                bundle has no routes to walk, and rendering would spend the
+                budget on nothing.
+            max_resources: cap on how many resources one scan fetches (0 = the
+                configured default). Lower it to bound a scan against a huge
+                site.
+            max_response_bytes: ceiling on one response body in bytes, counted
+                after decompression (default 10 MB, from config). A bigger
+                body is fetched streaming and cut at the cap, and the scan
+                returns issues[].code="response_truncated" for each cut URL
+                instead of stalling on a 20 MB download. Raise it ("20MB",
+                20971520) when the interesting region sits deeper in a giant
+                bundle; 0 keeps the configured default.
             js_dir: where to write the downloaded scripts. Pass an absolute
                 path to choose the location yourself, e.g. "/tmp/recon-acme".
                 A leading ``~`` is expanded; a relative path resolves against
@@ -224,7 +317,7 @@ def build_server(store: ScanStore):
                 would make online probing useless. Set true when you want
                 certificate errors to be treated as errors.
         """
-        raw = (url or "").strip()
+        raw = _clean_text(url).strip()
         if not raw:
             return {"error": "url is required"}
         if not raw.startswith(("http://", "https://")):
@@ -233,9 +326,30 @@ def build_server(store: ScanStore):
         # A fresh copy per call: one invocation must not leave its timeout or
         # probe setting behind for the next one.
         config = deepcopy(store.base) if store.base is not None else load_config()
-        if timeout_seconds > 0:
-            config.request.target_timeout = float(timeout_seconds)
+        js_dir = _clean_text(js_dir)
+        proxy = _clean_text(proxy)
+        no_proxy = _clean_text(no_proxy)
+        budget = _seconds(timeout_seconds, config.request.target_timeout)
+        if budget > 0:
+            config.request.target_timeout = float(budget)
         config.scope.probe_endpoints = probe
+        # A target that is itself a bundle has no routes to render and no
+        # entry document to walk: rendering would spend the whole budget
+        # fetching the same file forty times. The caller can still force it.
+        is_js_target = is_javascript_path(raw) or ".js" in urlparse(raw).path.lower()
+        if crawl_routes is None:
+            config.scope.crawl_routes = config.scope.crawl_routes and not is_js_target
+        else:
+            config.scope.crawl_routes = bool(crawl_routes) and not is_js_target
+        if max_resources > 0:
+            config.limits.max_resources = int(max_resources)
+        # Oversized bodies are cut in the HTTP client itself, streaming, so a
+        # 20 MB response costs one capped read instead of a memory spike that
+        # happens before any check could run. Raise it for a target whose
+        # interesting region sits deep in a giant bundle.
+        cap = _size_bytes(max_response_bytes, config.request.max_response_bytes)
+        if cap > 0:
+            config.request.max_response_bytes = cap
         # The caller's directory wins over the config default, and save_js is
         # honoured here rather than deep in the pipeline so the response can
         # state plainly that nothing was written.
@@ -271,6 +385,7 @@ def build_server(store: ScanStore):
         stats = result.statistics
         strong = [e for e in result.endpoints
                   if e.evidence in ("runtime", "full-url")]
+        timed_out = any(i.code == "target_timeout" for i in result.issues)
         return {
             "scan_id": scan_id,
             "target": result.target,
@@ -289,6 +404,20 @@ def build_server(store: ScanStore):
             "proxy_note": proxy_note or "",
             "resources": stats.resources,
             "endpoints": stats.endpoints,
+            # True means the wall-clock budget ran out before every phase
+            # finished: what follows is a subset, not the whole target. Reported
+            # here because "endpoints: 12" reads the same either way, and a
+            # model that takes a partial inventory for a complete one will stop
+            # looking.
+            "timed_out": timed_out,
+            "timeout_seconds": float(config.request.target_timeout),
+            # Structured, so a caller can branch on it: "code": "timeout" with
+            # "partial": true means this inventory is a subset and the next
+            # call should either raise the budget or narrow the target. A
+            # timeout is a normal return, never an exception and never a
+            # string sentinel in a numeric field.
+            "code": "timeout" if timed_out else "ok",
+            "partial": timed_out,
             "routes": stats.routes,
             "routes_rendered": sum(1 for r in result.routes if r.get("rendered")),
             "asset_manifests": len(result.assets),
@@ -431,6 +560,7 @@ def build_server(store: ScanStore):
         search: str = "",
         with_context: bool = False,
         limit: int = DEFAULT_LIMIT,
+        offset: int = 0,
     ) -> dict:
         """List sensitive-information findings (keys, tokens, credentials, PII).
 
@@ -439,7 +569,8 @@ def build_server(store: ScanStore):
             min_severity: "info", "low", "medium", "high" or "critical"
             search: substring match against rule name or value
             with_context: include surrounding source lines
-            limit: max rows (default 50)
+            limit: max rows (default 50, hard cap 1000)
+            offset: skip this many rows, for paging through a long list
         """
         try:
             result = store.get(scan_id)
@@ -461,7 +592,7 @@ def build_server(store: ScanStore):
         selected.sort(key=lambda f: (-severity_rank(f.severity.value), f.rule_name))
 
         rows = []
-        for finding in _limit(selected, limit):
+        for finding in _limit(selected, limit, offset):
             row = {
                 "severity": finding.severity.value,
                 "rule": finding.rule_name,
@@ -482,6 +613,9 @@ def build_server(store: ScanStore):
         return {
             "scan_id": scan_id,
             "count": len(rows),
+            "total": len(selected),
+            "offset": max(0, offset),
+            "has_more": max(0, offset) + len(rows) < len(selected),
             "by_severity": _severity_histogram(selected),
             "reconciliation": {
                 "extracted": extracted,
@@ -860,7 +994,7 @@ def build_server(store: ScanStore):
                      js_dir=result.js_dir)
 
     @mcp.tool()
-    def jsfind_js_search(
+    async def jsfind_js_search(
         scan_id: str,
         pattern: str,
         url_filter: str = "",
@@ -888,13 +1022,26 @@ def build_server(store: ScanStore):
             result = store.get(scan_id)
         except KeyError as exc:
             return {"error": str(exc)}
-        files = collect_js_files(result)
-        if not files:
+
+        def run_search():
+            # Regex over every collected bundle is seconds of CPU on a real
+            # SPA. FastMCP invokes a sync tool inline on the event loop, where
+            # it would stall tools/list for everything else -- so it runs on a
+            # worker instead.
+            found = collect_js_files(result)
+            if not found:
+                return None
+            return found, search(found, _clean_text(pattern),
+                                 ignore_case=ignore_case,
+                                 url_filter=_clean_text(url_filter),
+                                 max_matches=limit)
+
+        packed = await _offload(run_search)
+        if packed is None:
             return {"scan_id": scan_id, "count": 0, "total": 0,
                     "matches": [],
                     "note": "扫描没有保存任何 JS 产物；请用 download_js=true 重新扫描"}
-        outcome = search(files, pattern, ignore_case=ignore_case,
-                         url_filter=url_filter, max_matches=limit)
+        files, outcome = packed
         if outcome.error:
             return {"scan_id": scan_id, "error": outcome.error}
         rows = [m.to_dict() if with_context else
@@ -932,7 +1079,7 @@ def build_server(store: ScanStore):
         return build_surface(result)
 
     @mcp.tool()
-    def jsfind_analyze_file(
+    async def jsfind_analyze_file(
         files: list,
         base_url: str = "",
         export_json: str = "",
@@ -966,9 +1113,22 @@ def build_server(store: ScanStore):
             return {"error": "files is required"}
         config = deepcopy(store.base) if store.base is not None else load_config()
         scanner = Scanner(config)
+        base_url = _clean_text(base_url)
+        export_json = _clean_text(export_json)
         try:
-            local = analyze_local(config, scanner.engine, list(files),
-                                  base_url=base_url)
+            # Same extraction pass as a live scan, over files already on disk:
+            # seconds of CPU on a big bundle, so it runs off the event loop
+            # rather than stalling every other request while it works.
+            cleaned = []
+            for entry in files:
+                if isinstance(entry, dict):
+                    cleaned.append({k: _clean_text(v) if isinstance(v, str)
+                                    else v for k, v in entry.items()})
+                else:
+                    cleaned.append(_clean_text(entry))
+            local = await _offload(
+                analyze_local, config, scanner.engine, cleaned,
+                base_url=base_url)
         except LocalFileError as exc:
             return {"error": str(exc)}
         except Exception as exc:  # noqa: BLE001
@@ -1074,10 +1234,41 @@ def build_server(store: ScanStore):
             "url_rules": scanner.engine.url_count(),
             "sensitive_rules": scanner.engine.sensitive_count(),
             "banner_rules": len(banner_engine),
+            # Where stderr goes when the client does not read it. Empty when
+            # stderr is still the terminal it was started from.
+            "diagnostic_log": str(_utils.DIAGNOSTIC_LOG or ""),
+            # Reported, not enforced: several processes at once usually means
+            # a client restarted without reaping the last one, and the fix is
+            # to clean up, not to refuse the new one its server.
+            "instances_running": _utils.count_siblings(),
             "tool_count": len(await mcp.list_tools()),
             "tools": sorted(tool.name for tool in await mcp.list_tools()),
             "caveats": caveats,
         }
+
+    @mcp.tool()
+    def jsfind_release(scan_id: str = "") -> dict:
+        """Release collected scans from memory, now.
+
+        A finished scan holds every endpoint, finding and parameter of a whole
+        target, and a session that runs several targets accumulates all of
+        them. Entries also age out on their own (10 minutes, 20 scans by
+        default); this is for when the caller is done with a scan and wants the
+        memory back immediately.
+
+        Args:
+            scan_id: scan to drop. Empty drops every scan.
+        """
+        if scan_id:
+            try:
+                store.get(scan_id)
+            except KeyError as exc:
+                return {"error": str(exc)}
+            released = store.release(scan_id)
+            return {"released": [scan_id] if released else [],
+                    "remaining": store.ids()}
+        dropped = store.clear()
+        return {"released_count": dropped, "remaining": []}
 
     @mcp.tool()
     def jsfind_scans() -> dict:
@@ -1087,6 +1278,9 @@ def build_server(store: ScanStore):
         same target can be told apart. The list is in-memory and is lost when
         the server restarts -- use jsfind_analyze_file's export_json to keep
         evidence for a report.
+
+        Entries are bounded too: at most ``max_scans`` are kept and each expires
+        ``ttl`` seconds after it was stored. jsfind_release drops one now.
         """
         rows = []
         for scan_id in store.ids():
@@ -1108,8 +1302,11 @@ def build_server(store: ScanStore):
             "detail": rows,
             "session": store.session,
             "scan_count": len(rows),
-            "note": "内存中保存，服务重启即失效；要留存证据请用 "
-                    "jsfind_analyze_file 的 export_json。",
+            "max_scans": store.max_scans,
+            "ttl_seconds": store.ttl,
+            "note": "内存中保存，服务重启即失效，最多保留 max_scans 条、"
+                    "每条 ttl_seconds 后过期；jsfind_release 可立即释放。"
+                    "要留存证据请用 jsfind_analyze_file 的 export_json。",
         }
 
     @mcp.tool()
@@ -1176,7 +1373,7 @@ def build_server(store: ScanStore):
         verify_tls: bool = False,
         business_codes: dict | None = None,
         limit: int = 100,
-        timeout_seconds: int = 0,
+        timeout_seconds: int | str = 0,
         include_not_found: bool = False,
     ) -> dict:
         """Confirm an offline result's endpoints against a live target.
@@ -1230,8 +1427,9 @@ def build_server(store: ScanStore):
             config.request.no_proxy = no_proxy.strip()
         if business_codes:
             config.request.business_codes = dict(business_codes)
-        if timeout_seconds:
-            config.request.timeout = float(timeout_seconds)
+        budget = _seconds(timeout_seconds)
+        if budget > 0:
+            config.request.timeout = float(budget)
 
         base = (base_url or "").strip().rstrip("/")
         targets = []
@@ -1464,6 +1662,92 @@ def _default_js_dir(config: Config | None) -> str:
         return raw
 
 
+def _clean_text(value) -> str:
+    """Drop lone surrogates so a string can always be encoded and replied with.
+
+    A model can emit ``\\udcff`` in a URL or a path — a code unit with no
+    character behind it. Fine to hold in memory, but it cannot be written as
+    UTF-8, so the reply carrying it fails to serialize and the caller is left
+    waiting on a call that will never answer. Cheapest to strip it at the door.
+    """
+    text = str(value or "")
+    if not any("\ud800" <= ch <= "\udfff" for ch in text):
+        return text
+    return text.encode("utf-8", "replace").decode("utf-8", "replace")
+
+
+def _seconds(value, default: float = 0.0) -> float:
+    """A timeout from a caller that may not have sent a number.
+
+    Tool calls come out of a model, and a model reading an operator's config
+    will happily forward whatever it saw there — a bare env-var name like
+    ``REQUEST_TIMEOUT`` instead of the seconds it stands for. Strict typing
+    turns that into a client-side parse failure before the request is even
+    sent, which is what "the tools vanished" looked like from the outside.
+    Take the plausible forms and fall back to the default for the rest, so a
+    bad timeout costs the caller a default budget instead of the whole call.
+
+    The result is always clamped to ``MAX_TIMEOUT_SECONDS``: a model that asks
+    for a day of budget gets the cap and is told so, rather than a scan nobody
+    can wait for.
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value or "").strip().lower().rstrip("s")
+        if not text:
+            return default
+        try:
+            number = float(text)
+        except ValueError:
+            return default
+    if number <= 0:
+        return default
+    return min(number, MAX_TIMEOUT_SECONDS)
+
+
+#: Ceiling on a caller-supplied response cap. Higher than any bundle worth
+#: analyzing whole (chunking would refuse it long before), low enough that a
+#: model asking for "unlimited" cannot turn a hostile target into an OOM.
+MAX_RESPONSE_BYTES_CAP = 512 * 1024 * 1024
+
+
+def _size_bytes(value, default: int = 0) -> int:
+    """A byte count from a caller that may not have sent a plain number.
+
+    Same failure mode ``_seconds`` exists for: a model forwards ``"20MB"`` or
+    an env-var name where an integer is expected. Accept the plausible forms —
+    a number, a digit string, a ``20MB``/``1gb``/``512kb`` literal — and fall
+    back to the default for everything else, so one bad value costs the
+    configured cap instead of the whole call. 0 and negatives read as "no
+    opinion": the configured default wins.
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value or "").strip().lower().replace("_", "").replace(" ", "")
+        if not text:
+            return default
+        multiplier = 1
+        for suffix, factor in (("kb", 1024), ("mb", 1024 ** 2),
+                               ("gb", 1024 ** 3), ("k", 1024),
+                               ("m", 1024 ** 2), ("g", 1024 ** 3), ("b", 1)):
+            if text.endswith(suffix):
+                multiplier, text = factor, text[:-len(suffix)]
+                break
+        try:
+            number = float(text) * multiplier
+        except ValueError:
+            return default
+    if number <= 0:
+        return default
+    return min(int(number), MAX_RESPONSE_BYTES_CAP)
+
+
 def _limit(rows: list, limit: int, offset: int = 0) -> list:
     """Page a result set, clamped to something a model can actually read.
 
@@ -1548,11 +1832,21 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point for the MCP server."""
     # The config block is Chinese; without this a Windows console (or a frozen
     # build) writes it in the legacy code page and it arrives as mojibake.
-    use_utf8_stdio()
+    _utils.use_utf8_stdio()
+    # An MCP client usually never reads the stderr pipe it hands us. A scan
+    # logs every request, that pipe fills, and the server blocks in a write to
+    # it — which is how "the tools vanish until I restart" happens. Off the
+    # terminal, stderr goes to a log file instead.
+    _utils.redirect_diagnostics()
+    # A client that dies without closing the pipe leaves this process behind.
+    _utils.watch_parent()
     parser = argparse.ArgumentParser(
         prog="jsfind-mcp-server",
         description="jsfind-mcp MCP server (JavaScript information collection)",
     )
+    parser.add_argument("--version", action="version",
+                        version=f"{SERVER_NAME} {SERVER_VERSION}",
+                        help="print the version and exit")
     parser.add_argument("--transport", choices=("stdio", "http"), default="stdio",
                         help="stdio (default) or streamable HTTP")
     parser.add_argument("--host", default="127.0.0.1",
@@ -1579,7 +1873,11 @@ def main(argv: list[str] | None = None) -> int:
     except OSError:
         pass
 
-    store = ScanStore(config)
+    store = ScanStore(
+        config,
+        max_scans=int(os.getenv("JSFIND_MAX_SCANS", DEFAULT_MAX_SCANS)),
+        ttl=float(os.getenv("JSFIND_SCAN_CACHE_TTL", DEFAULT_SCAN_TTL)),
+    )
     server = build_server(store)
 
     # The client config is emitted before the transport starts, because this is
@@ -1606,6 +1904,10 @@ def main(argv: list[str] | None = None) -> int:
           f"regex backend={regex_backend()}, ast={_ast_available()}",
           file=sys.stderr)
     server.run(transport="stdio")
+    # stdin closed: the client is gone. Exit now rather than waiting on some
+    # thread to notice — a lingering process is exactly the pile of half-dead
+    # instances that makes "the tools vanished" look like it persisted.
+    os._exit(0)
     return 0
 
 

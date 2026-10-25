@@ -29,7 +29,20 @@ from .model import (
 )
 from .scanner import Scanner, Target
 
-__version__ = "1.0.0"
+# Read the version from the installed metadata instead of repeating it here.
+# The two had already drifted -- pyproject said 0.1.0 while this said 1.0.0, so
+# `pip show` and jsfind_diagnostics disagreed about what was installed.
+try:
+    from importlib.metadata import PackageNotFoundError as _PkgNotFound
+    from importlib.metadata import version as _dist_version
+
+    try:
+        __version__ = _dist_version("jsfind-mcp")
+    except _PkgNotFound:
+        # Running from a source checkout that was never installed.
+        __version__ = "0.1.0"
+except ImportError:  # pragma: no cover - Python < 3.8
+    __version__ = "0.1.0"
 
 __all__ = [
     "Banner",
