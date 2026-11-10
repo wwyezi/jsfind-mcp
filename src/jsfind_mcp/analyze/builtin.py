@@ -110,7 +110,11 @@ API_RULES: list[dict] = [
     {
         "id": "url.quoted",
         "name": "Quoted URL",
-        "pattern": r"""["'](https?://[^"'\s]+|(?:\.\./|\./|/)[^"'\s<>{}|\\`\[\]]+)["']""",
+        # A quoted path that is immediately a value in a webpack module table —
+        # "/ocq":function(e,t,n){...} — is a module key, not an interface. The
+        # negative lookahead drops exactly that shape; the batch kind gate in
+        # localfile then keeps real short paths (/api, /home).
+        "pattern": r"""["'](https?://[^"'\s]+|(?:\.\./|\./|/)[^"'\s<>{}|\\`\[\]]+)["'](?!\s*:\s*function)""",
         "group": 1,
     },
     {

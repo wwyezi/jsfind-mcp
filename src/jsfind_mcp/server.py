@@ -559,6 +559,7 @@ def build_server(store: ScanStore):
         min_severity: str = "",
         search: str = "",
         with_context: bool = False,
+        exclude_vendor: bool = True,
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
     ) -> dict:
@@ -569,6 +570,10 @@ def build_server(store: ScanStore):
             min_severity: "info", "low", "medium", "high" or "critical"
             search: substring match against rule name or value
             with_context: include surrounding source lines
+            exclude_vendor: drop findings from third-party library bundles
+                (vendor marker, minified build paths, /lib/). A vendor bundle
+                ships the library author's own keys, not the target's; keeping
+                them floods the report with high-severity noise. Default true.
             limit: max rows (default 50, hard cap 1000)
             offset: skip this many rows, for paging through a long list
         """
@@ -582,6 +587,8 @@ def build_server(store: ScanStore):
         selected = []
         for finding in result.findings:
             if finding.category is not RuleCategory.SENSITIVE:
+                continue
+            if exclude_vendor and finding.vendor:
                 continue
             if severity_rank(finding.severity.value) < minimum:
                 continue
@@ -610,6 +617,9 @@ def build_server(store: ScanStore):
         # confusion this prevents.
         extracted = sum(1 for f in result.findings
                         if f.category is RuleCategory.SENSITIVE)
+        excluded_vendor = sum(1 for f in result.findings
+                              if f.category is RuleCategory.SENSITIVE
+                              and f.vendor)
         return {
             "scan_id": scan_id,
             "count": len(rows),
@@ -623,6 +633,7 @@ def build_server(store: ScanStore):
                 "returned": len(rows),
                 "filtered_out": max(0, extracted - len(selected)),
                 "cut_by_limit": max(0, len(selected) - len(rows)),
+                "vendor_excluded": excluded_vendor if exclude_vendor else 0,
             },
             "findings": rows,
         }
@@ -1160,7 +1171,10 @@ def build_server(store: ScanStore):
             "sensitive_findings": result.statistics.findings,
             "parameters": result.statistics.parameters,
             "hints": result.hints[:10],
-            "note": "离线分析未发起任何网络请求；接口默认标记为未授权。",
+            "note": ("离线分析未发起任何网络请求，只分析给定文件；未被入口页面"
+                     "引用的后台路径需人工补文件后追加分析。"
+                     + ("已按 base_url 将同源端点标记为已授权。" if base_url
+                        else "未提供 base_url，接口默认标记为未授权。")),
         }
 
     @mcp.tool()

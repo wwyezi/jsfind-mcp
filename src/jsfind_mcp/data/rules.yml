@@ -51,7 +51,7 @@ rules:
   - name: 凭据字段值
     loaded: true
     f_regex: "(?i)(?:password|username|access[_-]?key|access[_-]?token|secret|pwd)\\s*[:=]\\s*['\\\"]?([A-Za-z0-9_@./:+*#~%-]{3,200})"
-    s_regex: "^(?![+\\-!*&|<>=])(?!.*(?:===|==|!=|&&|\\|\\|))(?!^[A-Za-z_$][\\w$]*(?:\\.[\\w$]+)+$)"
+    s_regex: "^(?![+\\-!*&|<>=])(?!.*(?:===|==|!=|&&|\\|\\|))(?!^[A-Za-z_$][\\w$]*(?:\\.[\\w$]+)+$)(?!^[A-Za-z_$][A-Za-z_$]*$)"
     format: '{1}'
     color: orange
     scope: response body
@@ -191,7 +191,7 @@ rules:
   - name: 用户名字段值
     loaded: true
     f_regex: "(?i)(?:user|username|uname)\\s*[:=]\\s*['\\\"]?([A-Za-z0-9_@./:+*#~%-]{2,40})"
-    s_regex: "^(?![+\\-!*&|<>=])(?!.*(?:===|==|!=|&&|\\|\\|))(?!^[A-Za-z_$][\\w$]*(?:\\.[\\w$]+)+$)"
+    s_regex: "^(?![+\\-!*&|<>=])(?!.*(?:===|==|!=|&&|\\|\\|))(?!^[A-Za-z_$][\\w$]*(?:\\.[\\w$]+)+$)(?!^[A-Za-z_$][A-Za-z_$]*$)"
     format: '{1}'
     color: yellow
     scope: response body

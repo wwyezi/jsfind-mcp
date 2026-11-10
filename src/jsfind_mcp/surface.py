@@ -12,7 +12,7 @@ actionable, a reason is.
 
 from __future__ import annotations
 
-from .model import RuleCategory, Severity, severity_rank
+from .model import Mode, RuleCategory, Severity, severity_rank
 
 #: write verbs that change server state; reachable without auth these are the
 #: first thing to try
@@ -432,6 +432,9 @@ def _coverage(result) -> dict:
     """
     runtime = [e for e in result.endpoints if e.evidence == "runtime"]
     caveats: list[str] = []
+    if getattr(result, "mode", None) == Mode.LOCAL:
+        caveats.append("离线模式只分析给定文件：未被入口页面引用的后台路径"
+                       "不会自动发现，需人工补文件后追加分析。")
     if not runtime:
         caveats.append(
             "没有 runtime 级证据：所有接口均来自静态分析，"

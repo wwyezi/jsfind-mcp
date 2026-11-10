@@ -71,6 +71,26 @@ _PSEUDO_TLDS = frozenset({
     "webpackjsonp", "webpackchunk", "jsonp", "chunk",
 })
 
+# TLDs a tester actually meets. A bare "label.label" that ends in one of these
+# is a host; one that ends in an arbitrary property name (a.alias,
+# a.bankaccountno, a.haveparttimejob) is a member access, not a host. This
+# positive check is what the _PSEUDO_TLDS blacklist could never finish — there
+# are more property names than could be listed. Internal/loopback suffixes are
+# kept so classify() can still label them internal_host rather than dropping
+# them outright.
+_KNOWN_TLDS = frozenset({
+    "com", "net", "org", "edu", "gov", "mil", "int", "io", "dev", "app",
+    "ai", "co", "me", "info", "biz", "name", "pro", "top", "xyz", "vip",
+    "club", "site", "online", "tech", "store", "shop", "cloud", "work",
+    "live", "link", "cc", "tv", "fm", "mobi", "asia", "travel",
+    "cn", "hk", "tw", "mo", "jp", "kr", "sg", "in", "uk", "de", "fr",
+    "ru", "br", "au", "ca", "us", "eu", "it", "es", "nl", "se", "ch",
+    "pl", "ua", "tr", "vn", "th", "my", "ph", "id", "kz", "il", "ir",
+    # internal / test suffixes — classify() marks these internal_host
+    "corp", "lan", "internal", "intranet", "local", "localhost", "home",
+    "test", "dev", "stage", "staging", "qa",
+})
+
 _MAX_HOSTS_PER_FILE = 200
 _MAX_HOST_EVIDENCE = 20
 
@@ -157,11 +177,22 @@ def hosts_from_text(source_url: str, body: str) -> list[HostCandidate]:
         # "http.get(" and "axios.create(" are member accesses, not hosts.
         if after == "(" or after in "@_":
             continue
-        if _plausible(candidate):
+        if _plausible(candidate) and _known_tld(candidate):
             add(candidate, match.start(1), "regex",
                 note="email_domain" if before == "@" else "")
 
     return out
+
+
+def _known_tld(host: str) -> bool:
+    """Whether a bare hostname ends in a TLD a tester actually meets.
+
+    Hosts read out of a ``://`` URL and IP literals are gated elsewhere, so
+    only the bare-``label.label`` pass calls this — exactly the shapes
+    ``obj.property`` shares, and the ones the blacklist could never exhaust.
+    """
+    suffix = (host or "").lower().rstrip(".").rsplit(".", 1)[-1]
+    return suffix in _KNOWN_TLDS
 
 
 def _strip_port(authority: str) -> str:
