@@ -40,6 +40,8 @@ class Candidate:
     vendor: bool = False
     source: str = ""              # ast | regex | cdp | sourcemap | html
     rule_id: str = ""
+    resolved: str = ""            # joined-prefix full URL
+    unresolved_prefix: bool = False
 
     def dedup_key(self) -> str:
         return f"{self.kind}\x00{self.method}\x00{self.raw}"

@@ -159,7 +159,7 @@ def _referenced_by_chunk_expression(body: str, name: str) -> bool:
         relative = body.find(name, start_from)
         if relative < 0:
             return False
-        start = start_from + relative
+        start = relative
         after = start + len(name)
         if start > 0 and _is_identifier_byte(body[start - 1]):
             start_from = after
@@ -174,7 +174,7 @@ def _referenced_by_chunk_expression(body: str, name: str) -> bool:
         statement_end = len(body)
         relative_end = body.find(";", cursor)
         if relative_end >= 0:
-            statement_end = cursor + relative_end
+            statement_end = relative_end
         if statement_end - statement_start <= 2000 and ".js" in body[statement_start:statement_end]:
             return True
         start_from = after

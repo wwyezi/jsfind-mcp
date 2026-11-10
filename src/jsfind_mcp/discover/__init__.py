@@ -2,7 +2,7 @@
 
 from .astapi import analyze_js
 from .astparams import params_from_ast
-from .basepath import base_path_names, normalize_base_path, scan_base_path_text
+from .basepath import (base_path_names, joined_prefixes, normalize_base_path, prefix_values, resolve_joined, scan_base_path_text)
 from .dynamic import fold_template, from_dynamic
 from .hosts import classify as classify_host
 from .hosts import host_from_url, hosts_from_text
@@ -68,6 +68,7 @@ __all__ = [
     "SPEC_PATHS",
     "SpecOperation",
     "base_path_names",
+    "joined_prefixes",
     "classify_host",
     "fold_template",
     "from_dynamic",
@@ -80,11 +81,13 @@ __all__ = [
     "json_field_names",
     "library_name",
     "normalize_base_path",
+    "prefix_values",
     "params_from_ast",
     "parse_html",
     "parse_source_map",
     "parser_available",
     "parser_error",
+    "resolve_joined",
     "scan_base_path_text",
     "source_map_reference",
     "spa_evidence",

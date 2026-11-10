@@ -505,6 +505,8 @@ def build_server(store: ScanStore):
                 "source_url": endpoint.source_url,
                 "line": endpoint.line,
                 "vendor": endpoint.vendor,
+                "resolved": endpoint.resolved,
+                "unresolved_prefix": endpoint.unresolved_prefix,
             }
             if with_context:
                 row["context"] = [
@@ -1451,6 +1453,9 @@ def build_server(store: ScanStore):
         for endpoint in result.endpoints:
             if endpoint.type != "api":
                 continue
+            if getattr(endpoint, "unresolved_prefix", False):
+                skipped_placeholder += 1
+                continue
             if route_param_names(endpoint.url):
                 skipped_placeholder += 1
                 continue
@@ -1466,7 +1471,7 @@ def build_server(store: ScanStore):
                 "scan_id": scan_id,
                 "probed": 0,
                 "note": "没有可探测的 api 端点（socket / route 不探测；"
-                        "含 {占位符} 的路径会跳过）。",
+                        "含 {占位符} 或前缀未解析的拼接路径会跳过）。",
                 "skipped_placeholder": skipped_placeholder,
             }
         targets = targets[:max(1, limit)]

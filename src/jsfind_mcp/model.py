@@ -236,6 +236,11 @@ class Endpoint:
     vendor: bool = False
     response_params: list[str] = field(default_factory=list)
     template: RequestTemplate | None = None
+    #: full URL resolved from a joined prefix expression,  when the
+    #: reference was not joined or the prefix value was unknown
+    resolved: str = ""
+    #: True when the path is a joined half whose prefix value is unknown
+    unresolved_prefix: bool = False
 
     @property
     def dedup_key(self) -> str:

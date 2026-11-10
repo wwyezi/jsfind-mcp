@@ -98,3 +98,50 @@ def base_path_names(candidates: list[BasePathCandidate]) -> list[str]:
             seen.add(candidate.raw)
             out.append(candidate.raw)
     return out
+
+_JOINED_RE = re.compile(
+    r"""([A-Za-z_$][\w$]*(?:\.[\w$]+)*)\s*\+\s*["'](/[^"'\s]{1,200})["']""")
+
+_PREFIX_VALUE_RE = re.compile(
+    r"""([A-Za-z_$][\w$]*(?:\.[\w$]+)*)\s*=\s*["'](https?://[^"'?\s]{1,300}|/[^"'?\s]{1,200})["']""")
+
+
+def joined_prefixes(body: str) -> dict[str, str]:
+    """Map each joined path half to the prefix expression that builds it.
+
+    ``D.a+"/downloadList"`` -> {"/downloadList": "D.a"}. The same expression is
+    usually reused across a whole bundle, so one lookup serves many endpoints.
+    """
+    out: dict[str, str] = {}
+    for match in _JOINED_RE.finditer(body or ""):
+        var, path = match.group(1), match.group(2)
+        if path not in out:
+            out[path] = var
+    return out
+
+
+def prefix_values(body: str) -> dict[str, str]:
+    """Map a prefix expression to the URL it is assigned in this file."""
+    out: dict[str, str] = {}
+    for match in _PREFIX_VALUE_RE.finditer(body or ""):
+        var, value = match.group(1), match.group(2)
+        if var not in out:
+            out[var] = value
+    return out
+
+
+def resolve_joined(raw: str, joined: dict[str, str],
+                   values: dict[str, str]) -> tuple[str, bool]:
+    """Resolve one joined path half against the file's prefix map.
+
+    Returns ``(resolved, unresolved)``: ``resolved`` is the full URL when the
+    prefix expression's value is known, ``unresolved`` is True when the path
+    was built from a prefix expression whose value could not be found.
+    """
+    var = joined.get(raw)
+    if not var:
+        return "", False
+    value = values.get(var)
+    if not value:
+        return "", True
+    return value.rstrip("/") + raw, False

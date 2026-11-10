@@ -54,6 +54,9 @@ from .discover import (
     analyze_js,
     base_path_names,
     collect_routes,
+    joined_prefixes,
+    prefix_values,
+    resolve_joined,
     find_manifest_references,
     find_spec_references,
     from_dynamic,
@@ -806,6 +809,13 @@ class Pipeline:
             self._extract_piece(source_url, piece, ast, skip, candidates,
                                 findings, params, hosts, base_paths, result)
 
+        joined = joined_prefixes(body)
+        values = prefix_values(body) if joined else {}
+        for candidate in candidates:
+            if candidate.raw in joined:
+                candidate.resolved, candidate.unresolved_prefix = \
+                    resolve_joined(candidate.raw, joined, values)
+
         self._merge_extracted(source_url, vendor, candidates, findings,
                               params, hosts, base_paths, queue, scope, result)
 
@@ -1098,6 +1108,8 @@ class Pipeline:
             body_params=candidate.body_params or (spec.param_keys() if spec else []),
             spec=spec,
             vendor=candidate.vendor,
+            resolved=candidate.resolved,
+            unresolved_prefix=candidate.unresolved_prefix,
         )
         # A socket has no HTTP request to reconstruct, and a template with a
         # wss:// request line is worse than no template at all.

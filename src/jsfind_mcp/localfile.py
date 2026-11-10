@@ -43,6 +43,9 @@ from .discover import (
     analyze_js,
     base_path_names,
     from_dynamic,
+    joined_prefixes,
+    prefix_values,
+    resolve_joined,
     from_javascript,
     from_protocols,
     from_requirejs,
@@ -371,17 +374,20 @@ def _absorb(result: Result, engine: Engine, config: Config, pseudo_url: str,
             f"{pseudo_url} 超过 {AST_MAX_BYTES} 字节，已跳过 AST 解析，"
             "仅做正则提取。")
 
+    joined = joined_prefixes(body)
+    values = prefix_values(body) if joined else {}
     for piece in split_by_lines(body):
         _absorb_piece(result, engine, config, pseudo_url, piece, ast, skip,
                       vendor, finding_keys, param_keys, endpoint_keys,
-                      base_paths, hints, local, resolved, base)
+                      base_paths, hints, local, resolved, base, joined, values)
 
 
 def _absorb_piece(result: Result, engine: Engine, config: Config,
                   pseudo_url: str, body: str, ast: bool, skip: bool,
                   vendor: bool, finding_keys: set, param_keys: set,
                   endpoint_keys: set, base_paths: list, hints: list,
-                  local: LocalResult, resolved: bool, base: str) -> None:
+                  local: LocalResult, resolved: bool, base: str,
+                  joined: dict | None = None, values: dict | None = None) -> None:
     """One piece of one body: the extractors themselves, unchunked."""
     regex_result = from_javascript(pseudo_url, body, engine)
     _merge_findings(result, regex_result.findings, finding_keys, vendor)
@@ -397,14 +403,14 @@ def _absorb_piece(result: Result, engine: Engine, config: Config,
     # AST understanding the file.
     for candidate in getattr(regex_result, "candidates", None) or []:
         _add_candidate(result, candidate, pseudo_url, base,
-                       endpoint_keys)
+                       endpoint_keys, joined, values)
     if not skip:
         _merge_params(result, regex_result.params, param_keys, vendor)
         base_paths.extend(base_path_names(regex_result.base_paths))
 
     if not skip and ast:
         for candidate in analyze_js(pseudo_url, body).candidates:
-            _add_candidate(result, candidate, pseudo_url, base, endpoint_keys)
+            _add_candidate(result, candidate, pseudo_url, base, endpoint_keys, joined, values)
         limit = config.limits.max_resources or 20_000
         candidates = from_webpack(pseudo_url, body, limit)
         candidates += from_requirejs(pseudo_url, body, limit)
@@ -415,7 +421,7 @@ def _absorb_piece(result: Result, engine: Engine, config: Config,
                 hints.append(text)
         for candidate in candidates:
             candidate.vendor = vendor
-            _add_candidate(result, candidate, pseudo_url, base, endpoint_keys)
+            _add_candidate(result, candidate, pseudo_url, base, endpoint_keys, joined, values)
         if ast:
             _merge_params(result, params_from_ast(pseudo_url, body), param_keys,
                           vendor)
@@ -435,7 +441,7 @@ def _absorb_piece(result: Result, engine: Engine, config: Config,
             ))
         for candidate in candidates:
             candidate.vendor = vendor
-            _add_candidate(result, candidate, pseudo_url, base, endpoint_keys)
+            _add_candidate(result, candidate, pseudo_url, base, endpoint_keys, joined, values)
         for operation in operations:
             entry = operation.to_dict()
             key = (entry["kind"], entry["name"], tuple(entry["fields"]))
@@ -532,7 +538,8 @@ def _in_scope(url: str, base: str) -> bool:
 
 
 def _add_candidate(result: Result, candidate, source_url: str,
-                   base: str | None, endpoint_keys: set) -> None:
+                   base: str | None, endpoint_keys: set,
+                   joined: dict | None = None, values: dict | None = None) -> None:
     """Normalize one candidate into an endpoint or route."""
     raw = (candidate.raw or "").strip()
     if not raw or raw.startswith(("data:", "javascript:", "blob:", "about:", "#")):
@@ -579,6 +586,9 @@ def _add_candidate(result: Result, candidate, source_url: str,
             spec.base_url_kind = "prefix"
             break
 
+    resolved, unresolved = "", False
+    if joined and raw in joined:
+        resolved, unresolved = resolve_joined(raw, joined, values or {})
     endpoint = Endpoint(
         raw=raw,
         url=url,
@@ -599,6 +609,8 @@ def _add_candidate(result: Result, candidate, source_url: str,
         body_params=candidate.body_params or spec.param_keys(),
         spec=spec if (spec.query or spec.body) else None,
         vendor=candidate.vendor,
+        resolved=resolved,
+        unresolved_prefix=unresolved,
     )
     # A socket has no HTTP request to reconstruct; a wss:// request line is
     # worse than no template at all.
