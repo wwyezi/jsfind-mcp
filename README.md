@@ -234,20 +234,6 @@ AI 看到 `403` 和 `404` 若没有语义标注，只能靠猜，而且通常往
 ## 启动时自动输出 MCP 配置
 
 启动时会打印可直接粘贴的配置，并写一份 `mcp.json` 到当前目录。
-输出走 **stderr**——stdio 传输下 stdout 被 JSON-RPC 占用。
-
-启动方式: 已安装的命令行入口（PATH 中的 jsfind-mcp）    传输: stdio
-命令    : jsfind-mcp
-
---- Claude Desktop / Cursor / CodeBuddy / VS Code（本地 stdio） -------------
-{
-  "mcpServers": {
-    "jsfind-mcp": {
-      "command": "jsfind-mcp",
-      "env": { "PYTHONIOENCODING": "utf-8" }
-    }
-  }
-}
 
 配置里的命令是**真实启动方式**，由启动器自动判定：
 
@@ -336,24 +322,6 @@ packaging/           # PyInstaller spec + 构建脚本
 devtools/            # 验证脚本
 tests/               # 单测与本地靶场
 ```
-
-### 验证脚本
-
-| 脚本                           | 验证什么                                                     |
-| ------------------------------ | ------------------------------------------------------------ |
-| `devtools/verify_expansion.py` | 本地起一个 SPA 靶场，验证资源清单 / 路由渲染 / 接口规范三个阶段真的能拿到懒加载 chunk |
-| `devtools/verify_tools.py`     | 用 MCP 传输层真实调用工具，确认新结果字段可被模型读到        |
-| `devtools/verify_banners.py`   | 版本号规则与工具清单                                         |
-| `devtools/verify_mcpconfig.py` | 生成的 MCP 配置能真的握手成功                                |
-| `devtools/verify_frozen.py`    | 打包后的二进制能真的跑                                       |
-| `devtools/verify_offline.py`   | 离线结果的查询与概览层：surface 不抛异常、authorized 有意义、diff 找得到遗漏 |
-| `devtools/verify_proxy.py`     | 起一个真实转发代理，验证流量确实经过它、密码不回显、`no_proxy` 与 `trust_env` 真的生效 |
-| `devtools/verify_budget.py`    | 一次扫描会在墙钟预算处停下并返回已得结果，而不是跑下去直到客户端断开 |
-| `devtools/deadlock_check.py`   | 客户端不读 stderr 管道时服务仍能应答（工具列表不会静默消失） |
-| `devtools/responsive_check.py` | 大 bundle 扫描进行中 `tools/list` 仍有响应、取消与坏消息不会杀死会话 |
-| `devtools/chunk_check.py`      | 大文件按行分块提取、跨块去重合并、AST 与拒绝阈值生效         |
-| `devtools/lifecycle_check.py`  | 扫描缓存 LRU+TTL 与显式释放、纯 JS 目标跳过路由渲染、超时结构化返回 |
-| `devtools/probe_gaps.py`       | 探测现有规则集的覆盖盲区                                     |
 
 ## 生态
 
