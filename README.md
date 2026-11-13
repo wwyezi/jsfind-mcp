@@ -66,8 +66,8 @@ Webpack / RequireJS / Vite chunk、source map 还原的原始源码、**资源�
 
 **方式一：直接用 exe（推荐，目标机不需要 Python）**
 
-下载 `jsfind-mcp.exe` 放到任意目录，在 MCP 客户端里指向它的绝对路径即可，
-配置写法，直接双击即可输出配置文件，粘贴到你使用的agent即可
+下载 `jsfind-mcp.exe` 放到任意目录，在 MCP 客户端里指向它的绝对路径即可
+也直接双击即可输出配置JSON，粘贴到你使用的agent
 ```json
 {
   "mcpServers": {
