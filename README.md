@@ -291,43 +291,6 @@ rules_file: ""           # 自定义敏感信息规则；留空用内置规则�
 banners_file: ""         # 自定义版本号规则；留空用内置规则集
 ```
 
-上面 5 个**顶层键**（`js_dir` / `save_js` / `request_template` / `rules_file` /
-`banners_file`）与 `request` / `concurrency` / `limits` / `scope` 四个区块都会被
-读取。`save_js: false` 是你要把凭据留在磁盘之外时的那个开关，请确认它生效。
-
-## 项目结构
-
-```text
-src/jsfind_mcp/
-├── server.py        # MCP Server：17 个工具
-├── mcpconfig.py     # 启动时生成可粘贴的客户端配置
-├── scanner.py       # 扫描执行
-├── pipeline.py      # 收集 + 提取流水线（含三个扩展阶段）
-├── collect.py       # 异步 HTTP 客户端
-├── scheduler.py     # 有界队列
-├── scope.py         # 作用域控制
-├── model.py         # 数据模型
-├── config.py        # 分层配置加载
-├── resources.py     # 内置数据定位（源码 / onefile / onedir 通用）
-├── rules.py         # HaE 兼容规则解析与编译
-├── banner.py        # 中间件版本识别引擎
-├── jssearch.py      # JS 产物检索
-├── surface.py       # 攻击面排序
-├── localfile.py     # 本地文件离线分析
-├── analyze/         # 正则规则引擎
-└── discover/        # 提取器
-    ├── html / javascript / astapi / astparams
-    ├── webpack / requirejs / dynamic      # chunk 发现
-    ├── manifest.py                        # 资源清单与预缓存列表
-    ├── routes.py                          # 路由表与渲染路径
-    ├── openapi.py                         # 接口规范解析
-    ├── protocols.py                       # WebSocket / SSE / GraphQL
-    ├── sourcemap / hosts / basepath / jsonshape / license
-
-packaging/           # PyInstaller spec + 构建脚本
-devtools/            # 验证脚本
-tests/               # 单测与本地靶场
-```
 
 ## 生态
 
